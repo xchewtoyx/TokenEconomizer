@@ -591,3 +591,50 @@ open-vocabulary. On a repository you do not trust, leave micro-skills off (the d
 * Windows (the launcher is POSIX `sh`), Python 3.9, and compressed Codex rollouts (`.zst`).
 * Transcript formats are internal to each agent and change between versions; the readers are
   pinned by tests against the shapes observed on the versions above.
+
+## 6. Live tests of the Hermes and OpenClaw ports
+
+`.github/workflows/live-ports.yml` runs §3's trap through each port's own CLI on OpenRouter:
+five sessions in `te probe`'s throwaway repository, where bare `pytest` is missing and
+`python -m unittest` works (`scripts/live/ports.py`; it lives beside `scripts/build_plugin.py`,
+not under `experiments/`, because it tests the plugin, not a benchmark arm). Hermes runs
+`v0.22.5` (`hermes chat -q … --max-turns 12`; the earlier `v2026.9.24` tag lacks the
+`PluginContext` methods the shim calls), OpenClaw `2026.10.8` (`openclaw agent exec`, capped by
+its timeout, since it has no turn limit). Each is set up as `plugin/README.md` describes, with
+`microskills=envfacts` (no model call to learn) and `TOKENECONOMIZER_HOME` under
+`$RUNNER_TEMP`. The job then checks, from the plugin's own state:
+
+* every session the plugin recorded has a ledger row with its model, token counts and effective
+  tokens (`priced_by` is `fallback` for a model `pricing.py` does not list, which is how every
+  non-Claude OpenRouter model is priced; the ledger counts tokens, not dollars);
+* a later session's start logged an `inject` event: the fact was learned, then injected;
+* `errors.log` is empty;
+* every session was folded at its own end (one that was not is folded by `te fold` so the rest
+  can run, and fails the job); on OpenClaw, its log exists.
+
+What is under test is the plugin, not the model. A run where the model ran no command, or met
+the trap too seldom to teach the fact, is reported **inconclusive** (a warning, not a failure);
+an OpenRouter rate limit is reported as **skipped**.
+
+**Running it.** Push to `claw-port` touching a port, `plugin/shared`, `plugin/scripts`,
+`tokeneconomizer/`, the driver or the workflow; or add the label `live-test` to a pull request
+into `claw-port` from a branch of this repository (re-add it to run again). A fork's pull
+request never runs it. A port not yet in the tree is skipped. `workflow_dispatch` works only
+once the workflow is on the default branch, which it is not meant to be. The state, the agents'
+transcripts and the runner's output are uploaded as an artifact kept 7 days, after removing any
+file that holds the key; nothing is committed.
+
+**The model** is `z-ai/glm-5.3-flash`, overridable with the repository variable `LIVE_MODEL` (an
+OpenRouter model id). At run start the job checks that OpenRouter still lists it with `tools` in
+its supported parameters, and fails if not, rather than substituting another model. OpenRouter
+routes it to one of many third-party providers, whose retention and training policies differ;
+the repository it sees is synthetic.
+
+**The budget guard** is the first step of each platform's job: `GET /api/v1/key` gives the key's
+`usage_weekly` (the current UTC week, from Monday), and the job is skipped with a notice when
+that plus the run's worst-case estimate exceeds $2.00. The estimate is five sessions at 300k
+input and 15k output tokens each, plus a quarter for the plugin's own side calls, at the most
+expensive provider's price that `GET /api/v1/models/<id>/endpoints` lists for the model. The
+spend is checked again before every session. Runs never overlap (one `concurrency` group), so
+each guard sees the previous run's spend. The guard reads one key's usage only; the hard
+backstop is a weekly credit limit set on that key in OpenRouter's settings.
