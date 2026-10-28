@@ -3,6 +3,9 @@ assertions over the plugin's state. The model path itself runs only in GitHub Ac
 import importlib.util
 import json
 import os
+import sys
+import time
+import urllib.error
 
 import pytest
 
@@ -15,15 +18,19 @@ _spec.loader.exec_module(ports)
 MODEL = "z-ai/glm-5.3-flash"
 
 
-def _openrouter(monkeypatch, weekly, tools=True, listed=True):
+def _openrouter(monkeypatch, weekly, tools=True, listed=True, endpoints=True):
     def get(path, key=None):
         if path == "/models":
             return {"data": [{"id": MODEL, "pricing": {"prompt": "0.0000001", "completion": "0.0000004"},
                               "supported_parameters": ["tools"] if tools else []}] if listed else []}
         if path.endswith("/endpoints"):
+            if endpoints is not True:
+                if isinstance(endpoints, Exception):
+                    raise endpoints
+                return endpoints
             return {"data": {"endpoints": [{"pricing": {"prompt": "0.0000002", "completion": "0.000001"}}]}}
         assert path == "/key" and key == "k"
-        return {"data": {"usage_weekly": weekly}}
+        return {"data": {"usage_weekly": weekly, "usage": 10.0}}
     monkeypatch.setattr(ports, "_get", get)
     monkeypatch.setenv("OPENROUTER_API_KEY", "k")
 
@@ -38,12 +45,12 @@ def _guard(monkeypatch, tmp_path, budget=2.0):
     return rc, dict(l.split("=", 1) for l in out.read_text().split()) if out.exists() else {}
 
 
-def test_the_estimate_prices_the_worst_endpoint_and_the_guard_stops_at_the_budget(
+def test_the_reserve_prices_the_dearest_endpoint_and_the_guard_stops_at_the_budget(
         monkeypatch, tmp_path):
-    est = ports.estimate(0.0000002, 0.000001)       # the dearer endpoint, not the listed price
+    est = ports.estimate(0.0000002, 0.000001)       # the endpoint's price, not the listed one
     assert est == pytest.approx(5 * (300_000 * 2e-7 + 15_000 * 1e-6) * 1.25)
     _openrouter(monkeypatch, weekly=0.0)
-    assert _guard(monkeypatch, tmp_path) == (0, {"run": "true", "estimate": f"{est:.4f}"})
+    assert _guard(monkeypatch, tmp_path) == (0, {"run": "true", "reserve": f"{est:.4f}"})
     _openrouter(monkeypatch, weekly=2.0 - est / 2)
     assert _guard(monkeypatch, tmp_path)[1]["run"] == "false"
 
@@ -87,3 +94,35 @@ def test_the_checks_fail_on_plugin_faults_and_call_a_model_without_tools_inconcl
                                                 "chars": 300}) + "\n")
     assert ("PASS", "fact injected at the start of 1 later session(s)") in ports.check(
         str(home), "hermes", str(tmp_path))
+
+
+@pytest.mark.parametrize("endpoints", [
+    urllib.error.URLError("down"), {"data": {"endpoints": []}}, {"data": {}},
+    {"data": {"endpoints": [{"pricing": {"prompt": "nan", "completion": "0.000001"}}]}},
+    {"data": {"endpoints": [{"pricing": {"prompt": "-1", "completion": "0.000001"}}]}}])
+def test_without_valid_endpoint_prices_the_guard_skips_rather_than_use_the_listed_price(
+        monkeypatch, tmp_path, endpoints):
+    _openrouter(monkeypatch, weekly=0.0, endpoints=endpoints)
+    assert _guard(monkeypatch, tmp_path) == (0, {"run": "false"})
+
+
+def _sleeper():
+    return [sys.executable, "-c", "import time; time.sleep(60)"]
+
+
+def test_the_watchdog_kills_the_agent_once_the_run_spends_its_trip(monkeypatch, tmp_path):
+    monkeypatch.setattr(ports, "WATCH_S", 0.05)
+    out, err, env = str(tmp_path / "o"), str(tmp_path / "e"), dict(os.environ)
+    reads = iter([0.01, 0.02, 0.5, 0.6])
+    t = time.monotonic()
+    rc, why = ports.run_watched(_sleeper(), str(tmp_path), env, out, err,
+                                spent=lambda: next(reads), trip=0.25)
+    assert rc is None and why.startswith("run reserve reached") and time.monotonic() - t < 10
+
+    def down():
+        raise urllib.error.URLError("down")
+    rc, why = ports.run_watched(_sleeper(), str(tmp_path), env, out, err, spent=down, trip=0.25)
+    assert rc is None and why.startswith("spend unknown")
+    rc, why = ports.run_watched([sys.executable, "-c", "print('done')"], str(tmp_path), env,
+                                out, err, spent=lambda: 0.0, trip=0.25)
+    assert (rc, why) == (0, None) and (tmp_path / "o").read_text() == "done\n"

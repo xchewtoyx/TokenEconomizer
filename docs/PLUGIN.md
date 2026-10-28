@@ -599,8 +599,8 @@ five sessions in `te probe`'s throwaway repository, where bare `pytest` is missi
 `python -m unittest` works (`scripts/live/ports.py`; it lives beside `scripts/build_plugin.py`,
 not under `experiments/`, because it tests the plugin, not a benchmark arm). Hermes runs
 `v0.22.5` (`hermes chat -q … --max-turns 12`; the earlier `v2026.9.24` tag lacks the
-`PluginContext` methods the shim calls), OpenClaw `2026.10.8` (`openclaw agent exec`, capped by
-its timeout, since it has no turn limit). Each is set up as `plugin/README.md` describes, with
+`PluginContext` methods the shim calls), OpenClaw `2026.10.8` (`openclaw agent exec`, which has
+no turn limit: its timeout and a 4096-token cap on each request's output bound it). Each is set up as `plugin/README.md` describes, with
 `microskills=envfacts` (no model call to learn) and `TOKENECONOMIZER_HOME` under
 `$RUNNER_TEMP`. The job then checks, from the plugin's own state:
 
@@ -620,9 +620,17 @@ an OpenRouter rate limit is reported as **skipped**.
 `tokeneconomizer/`, the driver or the workflow; or add the label `live-test` to a pull request
 into `claw-port` from a branch of this repository (re-add it to run again). A fork's pull
 request never runs it. A port not yet in the tree is skipped. `workflow_dispatch` works only
-once the workflow is on the default branch, which it is not meant to be. The state, the agents'
-transcripts and the runner's output are uploaded as an artifact kept 7 days, after removing any
-file that holds the key; nothing is committed.
+once the workflow is on the default branch, which it is not meant to be. Only an allowlist is
+uploaded, as an artifact kept 7 days: `$TOKENECONOMIZER_HOME`, the driver's log of each session,
+Hermes' `state.db` and OpenClaw's session transcripts (`*.jsonl`); never agent config,
+credentials or a home directory. Any staged file that still holds the key is dropped. Nothing
+is committed.
+
+**Before the first run**, create a GitHub Environment named `live` (Settings → Environments)
+with yourself as a required reviewer, and move `OPENROUTER_API_KEY` into it as an environment
+secret. The job names that environment, so every run then waits for approval before it can read
+the key. Until the environment exists, GitHub creates it on the first run with no protection
+rules and no secrets, and the job runs unapproved with the repository secret.
 
 **The model** is `z-ai/glm-5.3-flash`, overridable with the repository variable `LIVE_MODEL` (an
 OpenRouter model id). At run start the job checks that OpenRouter still lists it with `tools` in
@@ -630,11 +638,15 @@ its supported parameters, and fails if not, rather than substituting another mod
 routes it to one of many third-party providers, whose retention and training policies differ;
 the repository it sees is synthetic.
 
-**The budget guard** is the first step of each platform's job: `GET /api/v1/key` gives the key's
-`usage_weekly` (the current UTC week, from Monday), and the job is skipped with a notice when
-that plus the run's worst-case estimate exceeds $2.00. The estimate is five sessions at 300k
-input and 15k output tokens each, plus a quarter for the plugin's own side calls, at the most
-expensive provider's price that `GET /api/v1/models/<id>/endpoints` lists for the model. The
-spend is checked again before every session. Runs never overlap (one `concurrency` group), so
-each guard sees the previous run's spend. The guard reads one key's usage only; the hard
-backstop is a weekly credit limit set on that key in OpenRouter's settings.
+**The budget guard is best effort.** The only hard cap is a weekly credit limit set on the key
+itself in OpenRouter's settings; set one. The guard is the first step of each platform's job:
+`GET /api/v1/key` gives the key's `usage_weekly` (the current UTC week, from Monday), and the job
+is skipped with a notice when that plus the run's reserve exceeds $2.00. The reserve is an
+estimate, not a bound: five sessions at 300k input and 15k output tokens each, plus a quarter
+for the plugin's own side calls, at the dearest provider's price that
+`GET /api/v1/models/<id>/endpoints` lists for the model. Without those prices the job is skipped.
+While each session runs, a watchdog reads the key's spend every 15 s and kills the agent once
+the run has spent half its reserve; the other half covers what was spent but not yet reported,
+since OpenRouter's usage figure lags the requests. The weekly spend is also checked before every
+session. Runs never overlap (one `concurrency` group), so each guard sees the previous run's
+spend. The guard reads this one key's usage only.

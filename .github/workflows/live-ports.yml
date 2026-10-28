@@ -46,6 +46,9 @@ jobs:
       github.event_name != 'pull_request' ||
       (github.event.label.name == 'live-test' &&
        github.event.pull_request.head.repo.full_name == github.repository)
+    # The key belongs in this environment, with a required reviewer, so every run is approved
+    # first. Until the environment exists GitHub creates it empty and the job runs unprotected.
+    environment: live
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -120,6 +123,8 @@ jobs:
           npm install -g --no-fund --no-audit "openclaw@$OPENCLAW_VERSION"
           openclaw --version
           openclaw models set "openrouter/$LIVE_MODEL"
+          # A cap on each request's output; OpenClaw has no turn or total-token cap.
+          openclaw config set agents.defaults.params '{"maxTokens": 4096}'
           openclaw plugins install --link "$GITHUB_WORKSPACE/plugin/openclaw" --accept-capabilities
           openclaw plugins enable tokeneconomizer
           openclaw config set plugins.entries.tokeneconomizer.hooks.allowConversationAccess true
@@ -133,22 +138,33 @@ jobs:
         run: >-
           python scripts/live/ports.py run --platform "${{ matrix.platform }}"
           --model "$LIVE_MODEL" --budget "$LIVE_BUDGET_USD" --work "$LIVE_WORK"
+          --reserve "${{ steps.guard.outputs.reserve }}"
 
-      - name: Remove anything that holds the key before upload
+      # Only what is listed here is uploaded: the plugin's state, the driver's logs of each
+      # session, and the agents' session stores. No agent config, credentials or home directory.
+      - name: Stage the artifact
         if: always() && steps.guard.outputs.run == 'true'
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
-          dirs=()
-          for d in "$TOKENECONOMIZER_HOME" "$HERMES_HOME" "$LIVE_WORK" "$HOME/.openclaw"; do
-            [ -e "$d" ] && dirs+=("$d")
+          up="$RUNNER_TEMP/upload"
+          mkdir -p "$up"
+          [ -d "$TOKENECONOMIZER_HOME" ] && cp -a "$TOKENECONOMIZER_HOME" "$up/te-home"
+          [ -d "$LIVE_WORK/transcripts" ] && cp -a "$LIVE_WORK/transcripts" "$up/driver-logs"
+          for f in "$HERMES_HOME"/state.db "$HERMES_HOME"/state.db-wal "$HERMES_HOME"/state.db-shm; do
+            [ -f "$f" ] && mkdir -p "$up/hermes" && cp -a "$f" "$up/hermes/"
           done
-          [ ${#dirs[@]} -eq 0 ] && exit 0
+          if [ -d "$LIVE_WORK/openclaw-state" ]; then    # its session transcripts only
+            mkdir -p "$up/openclaw-sessions"
+            (cd "$LIVE_WORK/openclaw-state" &&
+              find . -type f -name '*.jsonl' -exec cp --parents {} "$up/openclaw-sessions/" \;)
+          fi
+          # A second layer: drop any staged file that holds the key's value.
           [ -n "$OPENROUTER_API_KEY" ] || exit 0
-          hits=$(printf '%s\n' "$OPENROUTER_API_KEY" | grep -rlF -f - "${dirs[@]}" || true)
+          hits=$(printf '%s\n' "$OPENROUTER_API_KEY" | grep -rlF -f - "$up" || true)
           if [ -n "$hits" ]; then
             printf '%s\n' "$hits" | xargs -d '\n' rm -f
-            echo "::warning::removed $(printf '%s\n' "$hits" | wc -l) file(s) holding the key"
+            echo "::warning::removed $(printf '%s\n' "$hits" | wc -l) staged file(s) holding the key"
           fi
 
       - name: Upload state and transcripts
@@ -159,12 +175,4 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
           include-hidden-files: true
-          path: |
-            ${{ runner.temp }}/te-home
-            ${{ runner.temp }}/live-work/transcripts
-            ${{ runner.temp }}/live-work/openclaw-state
-            ${{ runner.temp }}/hermes-home/state.db*
-            ${{ runner.temp }}/hermes-home/logs
-            ${{ runner.temp }}/hermes-home/config.yaml
-            ~/.openclaw/openclaw.json
-            ~/.openclaw/logs
+          path: ${{ runner.temp }}/upload

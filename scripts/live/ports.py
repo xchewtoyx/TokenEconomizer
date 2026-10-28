@@ -3,14 +3,21 @@
 `.github/workflows/live-ports.yml` (docs/PLUGIN.md §6).
 
   guard  Before anything is installed: the model is listed on OpenRouter and takes tools, and
-         this key's spend this week plus a worst-case estimate of one run stays under the
-         budget. Writes `run=true|false` to $GITHUB_OUTPUT; exits 1 only when the model check
+         this key's spend this week plus a reserve for one run stays under the budget. Writes
+         `run=true|false` and `reserve` to $GITHUB_OUTPUT; exits 1 only when the model check
          fails (a pinned model that vanished or lost tool support is breakage, not a skip).
+         Without every endpoint's price it skips: the reserve is priced at the dearest one.
   run    The five-session trap of docs/PLUGIN.md §3, in `te probe`'s repository (bare `pytest`
          missing, `python -m unittest` works), through the agent's own CLI on OpenRouter; then
          the assertions. What is under test is the plugin (fact learned, then injected; every
          session folded and priced), not the model's skill: a model that never ran a command,
          or never met the trap often enough to teach it, makes the run inconclusive, not failed.
+         A watchdog polls the key's spend while each session runs and kills the agent once the
+         run has spent half its reserve.
+
+The budget is best effort: the reserve is an estimate, not a bound (an agent can make more or
+larger requests than it assumes), and OpenRouter reports spend with a lag. The only hard cap is
+the weekly credit limit set on the key itself in OpenRouter.
 
 The key is read from OPENROUTER_API_KEY, sent only to openrouter.ai, and never printed.
 Standard library only; imports the plugin's own package for the trap repository and the hosts'
@@ -19,8 +26,10 @@ transcript readers.
 import argparse
 import glob
 import json
+import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -38,9 +47,13 @@ SESSIONS = 5
 MAX_TURNS = 12              # Hermes `--max-turns`; OpenClaw has no such switch, its timeout caps it
 SESSION_TIMEOUT_S = 300
 FOLD_WAIT_S = 90
-# Worst case for one session, for the budget estimate: 12 requests of up to ~25k context each,
-# and the plugin's own side calls (loop-guard judge) on top.
+# The reserve for one session: 12 requests of up to ~25k context each, and the plugin's own side
+# calls (loop-guard judge) on top. An estimate of a heavy session, not a bound.
 IN_CAP, OUT_CAP, SIDE_CALLS = 300_000, 15_000, 1.25
+WATCH_S = 15                # how often the watchdog reads the key's spend
+# The watchdog trips at this share of the reserve: OpenRouter's usage figure trails the requests
+# by up to a minute or so, and the rest of the reserve covers what is spent but not yet reported.
+TRIP_SHARE = 0.5
 RATE_LIMIT = re.compile(r"\b429\b|rate[ -]?limit", re.I)
 
 
@@ -67,14 +80,14 @@ def _summary(text):
 
 
 def estimate(prompt_price, completion_price, sessions=SESSIONS):
-    """Worst-case dollars for one run at the given per-token prices."""
+    """The dollars reserved for one run at the given per-token prices."""
     return sessions * (IN_CAP * prompt_price + OUT_CAP * completion_price) * SIDE_CALLS
 
 
 def model_prices(model):
     """(prompt, completion) $/token for `model`: the most expensive endpoint OpenRouter may route
-    to, since it picks among providers per request. Exits 1 when the model is not listed or
-    does not take tools."""
+    to, since it picks among providers per request; None when those prices cannot be read or
+    are not valid. Exits 1 when the model is not listed or does not take tools."""
     listed = {m["id"]: m for m in _get("/models")["data"]}
     m = listed.get(model)
     if not m:
@@ -85,19 +98,21 @@ def model_prices(model):
         print(f"::error::model {model!r} does not list `tools` in its supported parameters on "
               "OpenRouter; the trap needs a model that calls tools")
         sys.exit(1)
-    prices = [(float(m["pricing"]["prompt"]), float(m["pricing"]["completion"]))]
     try:
         eps = _get(f"/models/{model}/endpoints")["data"]["endpoints"]
-        prices += [(float(e["pricing"]["prompt"]), float(e["pricing"]["completion"])) for e in eps]
-    except (urllib.error.URLError, KeyError, TypeError, ValueError):
-        print(f"::warning::no endpoint prices for {model}; using the model's listed price")
+        prices = [(float(e["pricing"]["prompt"]), float(e["pricing"]["completion"])) for e in eps]
+    except (urllib.error.URLError, OSError, KeyError, TypeError, ValueError):
+        return None
+    if not prices or not all(math.isfinite(x) and x >= 0 for pc in prices for x in pc):
+        return None
     return max(p for p, _ in prices), max(c for _, c in prices)
 
 
-def weekly_usage(key):
-    """This key's spend in the current UTC week (Monday start), or None if not reported."""
-    w = (_get("/key", key).get("data") or {}).get("usage_weekly")
-    return float(w) if isinstance(w, (int, float)) else None
+def key_usage(key):
+    """(spend this UTC week from Monday or None if not reported, all-time spend) for this key."""
+    d = _get("/key", key).get("data") or {}
+    w = d.get("usage_weekly")
+    return (float(w) if isinstance(w, (int, float)) else None), float(d.get("usage") or 0)
 
 
 def cmd_guard(args):
@@ -106,29 +121,36 @@ def cmd_guard(args):
                  "(the port is not merged here yet).")
         _out(run="false")
         return 0
-    p, c = model_prices(args.model)
+    prices = model_prices(args.model)
+    if prices is None:
+        _summary(f"**{args.platform}**: SKIPPED: OpenRouter's endpoint prices for `{args.model}` "
+                 "could not be read, so no reserve can be priced.")
+        print(f"::notice::{args.platform} live test skipped: no endpoint prices for the model")
+        _out(run="false")
+        return 0
+    p, c = prices
     est = estimate(p, c)
     key = os.environ.get("OPENROUTER_API_KEY")
     if not key:
         print("::error::OPENROUTER_API_KEY is not set")
         _out(run="false")
         return 1
-    week = weekly_usage(key)
+    week = key_usage(key)[0]
     if week is None:
-        # No weekly figure: only the per-run cap and the trigger rules bound the week.
+        # No weekly figure: only the run's reserve, its watchdog and the triggers bound the week.
         print("::warning::OpenRouter reported no usage_weekly for this key; falling back to the "
-              "per-run cap alone. Set a weekly credit limit on the key itself.")
+              "run's reserve alone. Set a weekly credit limit on the key itself.")
         go = est <= args.budget
     else:
         go = week + est <= args.budget
     week_s = "unknown" if week is None else f"${week:.4f}"
-    _summary(f"**{args.platform}** on `{args.model}`: worst-case run ${est:.4f} "
+    _summary(f"**{args.platform}** on `{args.model}`: run reserve ${est:.4f} "
              f"(at ${p * 1e6:.4f}/M in, ${c * 1e6:.4f}/M out), spent this week {week_s}, "
              f"budget ${args.budget:.2f} -> {'run' if go else 'SKIPPED: over the weekly budget'}")
     if not go:
         print(f"::notice::{args.platform} live test skipped: weekly budget ${args.budget:.2f} "
               f"would be exceeded")
-    _out(run="true" if go else "false", estimate=f"{est:.4f}")
+    _out(run="true" if go else "false", reserve=f"{est:.4f}")
     return 0
 
 
@@ -275,6 +297,39 @@ def wait_folded(home, platform, before, timeout=FOLD_WAIT_S):
         time.sleep(2)
 
 
+def run_watched(cmd, cwd, env, out_path, err_path, spent=None, trip=None,
+                timeout=SESSION_TIMEOUT_S):
+    """Run one agent session, its output to files. Every WATCH_S, `spent()` (this run's spend so
+    far) is read; at `trip` dollars, or after three reads in a row fail, or at `timeout`, the
+    agent's whole process group is killed. Returns (exit code or None, why it was stopped)."""
+    with open(out_path, "w") as out, open(err_path, "w") as err:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=err,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+    deadline, fails, why = time.monotonic() + timeout, 0, None
+    while why is None:
+        try:
+            return proc.wait(timeout=WATCH_S), None
+        except subprocess.TimeoutExpired:
+            pass
+        if time.monotonic() > deadline:
+            why = f"timed out after {timeout}s"
+        elif spent is not None:
+            try:
+                fails, now = 0, spent()
+            except (urllib.error.URLError, OSError, ValueError):
+                fails, now = fails + 1, None
+            if fails >= 3:
+                why = "spend unknown: the key's usage could not be read"
+            elif now is not None and now >= trip:
+                why = f"run reserve reached (${now:.4f} spent, trips at ${trip:.4f})"
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+    return None, why
+
+
 def cmd_run(args):
     home = os.environ.get("TOKENECONOMIZER_HOME")
     if not home:
@@ -287,28 +342,31 @@ def cmd_run(args):
     env = dict(os.environ, PATH=trap + os.pathsep + os.environ.get("PATH", ""),
                TE_MICROSKILLS="envfacts")
     key = os.environ.get("OPENROUTER_API_KEY")
+    watch = bool(key) and not args.no_budget_check
+    if watch and not args.reserve:
+        raise SystemExit("run needs --reserve (the guard's `reserve` output)")
+    start = key_usage(key)[1] if watch else 0.0
+    spent = (lambda: key_usage(key)[1] - start) if watch else None
+    trip = (args.reserve or 0) * TRIP_SHARE
     at_end = {}
     for i in range(1, SESSIONS + 1):
-        if key and not args.no_budget_check:
-            week = weekly_usage(key)
+        if watch:
+            week, _ = key_usage(key)
             if week is not None and week >= args.budget:
                 _summary(f"**{args.platform}**: STOPPED before session {i}: this week's spend "
                          f"${week:.4f} reached the ${args.budget:.2f} budget.")
                 return 0
         before = set(te_sessions(home, args.platform))
         cmd = agent_cmd(args.platform, args.model, repo, work)
-        try:
-            out = subprocess.run(cmd, cwd=repo, env=env, capture_output=True, text=True,
-                                 timeout=SESSION_TIMEOUT_S, stdin=subprocess.DEVNULL)
-            stdout, stderr, rc = out.stdout or "", out.stderr or "", out.returncode
-        except subprocess.TimeoutExpired as e:
-            raw = e.stdout or ""
-            stdout = raw.decode(errors="replace") if isinstance(raw, bytes) else raw
-            stderr, rc = f"timed out after {SESSION_TIMEOUT_S}s", "timeout"
-        for ext, text in (("out", stdout), ("err", stderr)):
-            with open(os.path.join(logs, f"session-{i}.{ext}"), "w", encoding="utf-8") as fh:
-                fh.write(text)
-        print(f"session {i}: exit {rc}")
+        out_p, err_p = (os.path.join(logs, f"session-{i}.{x}") for x in ("out", "err"))
+        rc, why = run_watched(cmd, repo, env, out_p, err_p, spent, trip)
+        stdout, stderr = (open(p, encoding="utf-8", errors="replace").read() for p in (out_p, err_p))
+        print(f"session {i}: exit {rc}" + (f" (stopped: {why})" if why else ""))
+        if why and why.startswith(("run reserve", "spend unknown")):
+            _summary(f"**{args.platform}**: STOPPED in session {i}: {why}. The agent was killed; "
+                     "OpenRouter's usage lags, so a little more may still be billed.")
+            print(f"::error::{args.platform}: stopped: {why}")
+            return 1
         if rc != 0 and RATE_LIMIT.search(stdout + stderr):
             _summary(f"**{args.platform}**: skipped: OpenRouter rate limit at session {i} "
                      "(not a failure; re-run later).")
@@ -342,6 +400,8 @@ def main(argv=None):
     ap.add_argument("--model", required=True, help="an OpenRouter model id")
     ap.add_argument("--budget", type=float, default=2.00, help="dollars per UTC week, this key")
     ap.add_argument("--work", default=None, help="run: the scratch directory")
+    ap.add_argument("--reserve", type=float, default=None,
+                    help="run: the guard's reserve in dollars; the watchdog trips at half of it")
     ap.add_argument("--allow-error", action="append", default=[],
                     help="run: a regex for an errors.log line that is expected")
     ap.add_argument("--no-budget-check", action="store_true",
