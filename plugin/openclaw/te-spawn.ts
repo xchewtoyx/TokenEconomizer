@@ -4,7 +4,7 @@
  * open: a launcher that is missing, slow or broken yields "", and `hookOutput` turns that into
  * `{}` (no change). The OpenClaw extension carries a byte-identical copy, pinned by a test.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 export const truthy = (v: string | undefined) => ["1", "true", "yes", "on"].includes((v ?? "").trim().toLowerCase());
 
@@ -45,6 +45,18 @@ export function runLauncher(
     child.stdin.on("error", () => {});
     child.stdin.end(input);
   });
+}
+
+/** `runLauncher`, blocking: for a process about to exit, which would leave a pending child
+ * without its input or its answer. */
+export function runLauncherSync(path: string, args: string[], input: string, env: Record<string, string>, timeoutMs: number): string {
+  try {
+    const r = spawnSync(path, args, { input, env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "ignore"],
+                                      timeout: timeoutMs, killSignal: "SIGKILL", encoding: "utf8" });
+    return r.error ? "" : r.stdout ?? "";
+  } catch {
+    return "";
+  }
 }
 
 /** The dispatcher's answer: the last line of its stdout as JSON; `{}` on anything else. */

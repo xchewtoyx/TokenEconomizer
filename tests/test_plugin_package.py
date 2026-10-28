@@ -480,6 +480,16 @@ if (scenario === "main") {
   out.empty = await api.hooks.before_prompt_build({ prompt: "x", messages: [] }, ctxOf("E", "x", { workspaceDir: join(home, "empty") }));
   out.real = mod.inRepo(repo);
   out.noLog = mod.lastSegment("H") + mod.lastSegment("E");
+} else if (scenario === "exec") {
+  // `openclaw agent exec`: one run, no `session_end`, then the process exits.
+  out.detected = [["node", "openclaw", "gateway", "run"], ["node", "openclaw", "agent", "-m", "hi"],
+                  ["node", "openclaw", "agent", "--agent", "main", "exec", "fix it"]].map((a) => mod.oneShotExec(a));
+  process.argv = [process.argv[0], "/usr/lib/openclaw/openclaw.mjs", "agent", "exec", "--json", "fix it"];
+  const ex = reg(await load(3));
+  await ex.hooks.before_prompt_build({ prompt: "fix it", messages: [] }, ctxOf("X", "r1"));
+  await ex.hooks.agent_end({ messages: [{ role: "user", content: "fix it", timestamp: 1 }, asst(2, "c1")] }, ctxOf("X", "r1"));
+  console.log(JSON.stringify(out));
+  process.exit(0);
 }
 console.log(JSON.stringify(out));
 """
@@ -544,6 +554,7 @@ def test_the_openclaw_plugin_logs_each_message_once_across_reloads_and_starts_fr
     # What the dispatcher recorded: one segment, started, then started again from its log.
     sess = st.read(os.path.join("sessions", "S1#1.json"))
     assert sess["source"] == "resume" and sess["cwd"] == str(repo)
+    assert "end_reason" not in sess                     # not an exec run: no end at its exit
     assert [t["turn_key"] for t in sess["turns"]] == ["S1#1:r1", "S1#1:r2"]   # one turn per run
     assert [t["turn_key"] for t in st.read(os.path.join("sessions", "S6#1.json"))["turns"]] == []
     assert st.read(os.path.join("sessions", "S6#1.json"))["turn"]["turn_key"] == "S6#1:w1"
@@ -623,6 +634,21 @@ def test_the_openclaw_plugin_takes_a_checkout_as_the_core_does(tmp_path):
     from tokeneconomizer.plugin.paths import find_repo_root
     assert find_repo_root(str(home / "user" / "ws"), {"HOME": str(home / "user")}) is None
     assert find_repo_root(str(home / "empty"), {"HOME": "/nonexistent"}) is None
+
+
+def test_an_openclaw_agent_exec_run_is_ended_and_folded_when_its_process_exits(tmp_path):
+    """`openclaw agent exec` (2026.10.8) fires no `session_end` and exits right after it prints,
+    without waiting for `agent_end` handlers (run 40774930744): in that process the plugin sends
+    Stop blocking and SessionEnd at exit, so the run is folded with its turn closed. Only argv
+    marks such a process; the gateway's never reads `agent … exec`."""
+    out, repo, home = _openclaw_node(tmp_path, "exec", TE_FOLD_SYNC="1")
+    assert out["detected"] == [False, False, True]
+    st = _openclaw_store(repo, home)
+    sess = st.read(os.path.join("sessions", "X#1.json"))
+    assert sess["end_reason"] == "exit"
+    assert [t["turn_key"] for t in sess["turns"]] == ["X#1:r1"]      # Stop closed it first
+    ledger = {r["session_id"]: r for r in st.read_lines("ledger.jsonl")}
+    assert ledger["X#1"]["requests"] == 1
 
 
 def test_the_openclaw_quiet_limit_is_inside_the_folds(tmp_path):
