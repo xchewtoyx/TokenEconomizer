@@ -442,6 +442,22 @@ if (scenario === "main") {
   await api.hooks.agent_end({ messages: [u, asst(2, "c1"), u2, asst(11, "c2")] }, ctxOf("M", "r2"));
   await api.hooks.session_end({ sessionId: "M", reason: "idle" }, { sessionId: "M" });
   out.segments = mod.lastSegment("M");
+} else if (scenario === "late") {
+  // The next prompt arrives before the old run's agent_end: the old segment is ended (and, with
+  // TE_FOLD_SYNC, folded) only after that agent_end has logged the run.
+  const u = { role: "user", content: "one", timestamp: 1 };
+  const u2 = { role: "user", content: "two", timestamp: 10 };
+  await api.hooks.before_prompt_build({ prompt: "one", messages: [] }, ctxOf("N", "r1"));
+  const old = (Date.now() - 570_000) / 1000;
+  utimesSync(mod.logPath(mod.segment("N", 1)), old, old);
+  const second = api.hooks.before_prompt_build({ prompt: "two", messages: [] }, ctxOf("N", "r2"));
+  await new Promise((done) => setTimeout(done, 300));
+  await api.hooks.agent_end({ messages: [u, asst(2, "c1")] }, ctxOf("N", "r1"));
+  await second;
+  await api.hooks.agent_end({ messages: [u, asst(2, "c1"), u2, asst(11, "c2")] }, ctxOf("N", "r2"));
+  await api.hooks.session_end({ sessionId: "N", reason: "idle" }, { sessionId: "N" });
+  out.first = read(mod.segment("N", 1)).slice(1).map((e) => e.message.role);
+  out.second = read(mod.segment("N", 2)).slice(1).map((e) => e.message.role);
 } else if (scenario === "repo") {
   // A workspace below a versioned home is not a checkout, nor is one with an empty `.git`.
   const h = join(home, "user");
@@ -566,6 +582,17 @@ def test_a_segment_change_ends_the_quiet_segment_so_both_are_folded(tmp_path):
     ledger = {r["session_id"]: r for r in st.read_lines("ledger.jsonl")}
     assert set(ledger) == {"M#1", "M#2"}
     assert ledger["M#1"]["requests"] == ledger["M#2"]["requests"] == 1
+
+
+def test_a_segment_is_ended_only_after_its_last_run_is_logged(tmp_path):
+    """The next prompt can start a segment before the old run's `agent_end`: the old segment's
+    SessionEnd, whose fold reads its log, waits for that `agent_end` to write the run."""
+    out, repo, home = _openclaw_node(tmp_path, "late", TE_FOLD_SYNC="1")
+    assert out["first"] == ["user", "assistant"] and out["second"] == ["user", "assistant"]
+    st = _openclaw_store(repo, home)
+    ledger = {r["session_id"]: r for r in st.read_lines("ledger.jsonl")}
+    assert ledger["N#1"]["requests"] == 1                # folded after the run was logged
+    assert not (home / "errors.log").exists() or "not yet logged" not in (home / "errors.log").read_text()
 
 
 def test_the_openclaw_plugin_takes_a_checkout_as_the_core_does(tmp_path):

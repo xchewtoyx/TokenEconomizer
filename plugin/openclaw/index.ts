@@ -47,6 +47,8 @@ const COMMAND_MS = 60_000;
 // dispatcher may fold it, once. The next segment starts with the facts as they are then, so its
 // `appendSystemContext` may differ; a gap this long has outlived a provider's prompt cache anyway.
 export const QUIET_MS = 540_000;
+// How long a segment change waits for the old segment's last `agent_end` to log its run.
+const ENDING_WAIT_MS = 5_000;
 
 // The names the dispatcher's mechanisms read (`loopguard/state.canon_tool`, `microskills/observe`).
 export const TOOL_NAMES: Record<string, string> = {
@@ -118,6 +120,14 @@ function fresh(seg: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** A line in the plugin's `errors.log`, which `te doctor` shows. */
+function errorLine(text: string) {
+  try {
+    mkdirSync(stateRoot(), { recursive: true, mode: 0o700 });
+    appendFileSync(join(stateRoot(), "errors.log"), `--- ${new Date().toISOString().slice(0, 19)} ${text}\n`);
+  } catch {}
 }
 
 function touch(seg: string) {
@@ -260,14 +270,11 @@ export default {
     }
 
     const starting = new Map<string, Promise<Session | undefined>>();
-    // Per session, the work that must not overlap a segment change: `agent_end` and the change.
-    const queues = new Map<string, Promise<unknown>>();
-    function serial<T>(sid: string, fn: () => Promise<T>): Promise<T> {
-      const run = (queues.get(sid) ?? Promise.resolve()).catch(() => {}).then(fn);
-      queues.set(sid, run);
-      run.finally(() => queues.get(sid) === run && queues.delete(sid)).catch(() => {});
-      return run;
-    }
+    // Runs that opened a turn and whose `agent_end` has not logged them yet: a segment is ended
+    // only once its runs are in its log (or ENDING_WAIT_MS has passed).
+    type Run = { s: Session; turn: string; logged: () => void; inLog: Promise<void> };
+    const runs = new Map<string, Run>();
+    const runKey = (sid: string, runId: string) => `${sid}\u0000${runId}`;
 
     /** Start the session's next segment (or, after a plugin reload, its still-fresh last one) and
      * publish it once SessionStart has answered; undefined when it has no repository yet. */
@@ -283,7 +290,18 @@ export default {
       const s: Session = { seg, cwd, facts: "", turn: "", runId: "", prompts: 0, channel: String(ctx.channel ?? "") };
       if (logged && !again) {
         // The quiet segment ends here, so the dispatcher folds it now rather than when, and
-        // if, another session starts after it has been quiet for `fold.STALE_S`.
+        // if, another session starts after it has been quiet for `fold.STALE_S`. Its fold reads
+        // the log, so a run of it still waiting for `agent_end` is waited for first.
+        const open = [...runs.values()].filter((r) => r.s.seg === last).map((r) => r.inLog);
+        if (open.length) {
+          let timer: any;
+          const late = await Promise.race([
+            Promise.all(open).then(() => false),
+            new Promise<boolean>((done) => (timer = setTimeout(() => done(true), ENDING_WAIT_MS))),
+          ]);
+          clearTimeout(timer);
+          if (late) errorLine(`openclaw: segment ${last} ended with ${open.length} run(s) not yet logged`);
+        }
         await hook({ seg: last, cwd: logged, channel: s.channel }, { hook_event_name: "SessionEnd", reason: "segment" }, PROMPT_MS);
       }
       writeHeader(seg, cwd);
@@ -327,7 +345,7 @@ export default {
             // One SessionStart per segment: a concurrent build waits for the one in flight.
             let p = starting.get(sid);
             if (!p) {
-              p = serial(sid, () => startSegment(sid, ctx)).finally(() => starting.delete(sid));
+              p = startSegment(sid, ctx).finally(() => starting.delete(sid));
               starting.set(sid, p);
             }
             s = await p;
@@ -341,6 +359,11 @@ export default {
             s.prompts += 1;
             s.runId = runId;
             s.turn = `${s.seg}:${runId || s.prompts}`;
+            if (runId) {
+              let logged = () => {};
+              const inLog = new Promise<void>((done) => (logged = done));
+              runs.set(runKey(sid, runId), { s, turn: s.turn, logged, inLog });
+            }
             const out = await hook(s, { hook_event_name: "UserPromptSubmit", prompt_id: s.turn, prompt: event?.prompt ?? "" }, PROMPT_MS);
             // The repository map arrives on a segment's first prompt, before any text was sent,
             // and joins the facts; later prompts' context never does, so the text stays the same.
@@ -405,14 +428,20 @@ export default {
       async (event: any, ctx: any) => {
         try {
           if (ignored(ctx)) return undefined;
-          const s = sessions.get(ctx.sessionId);
+          // The run's own segment, which a later prompt may have rolled over from.
+          const key = runKey(ctx.sessionId, String(ctx.runId ?? ""));
+          const run = runs.get(key);
+          const s = run?.s ?? sessions.get(ctx.sessionId);
           if (!s) return undefined;
           // shortcut: a single tool call longer than QUIET_MS can let its segment be folded under
           // it; the turn's messages then go unlearned. Rare; a keep-alive timer would close it.
-          await serial(ctx.sessionId, async () => {
+          try {
             appendMessages(ctx.sessionId, Number(s.seg.slice(s.seg.lastIndexOf("#") + 1)), event?.messages ?? []);
-            await hook(s, { hook_event_name: "Stop", prompt_id: s.turn, stop_hook_active: false }, END_MS);
-          });
+          } finally {
+            runs.delete(key);
+            run?.logged();
+          }
+          await hook(s, { hook_event_name: "Stop", prompt_id: run?.turn ?? s.turn, stop_hook_active: false }, END_MS);
         } catch {}
         return undefined;
       },
