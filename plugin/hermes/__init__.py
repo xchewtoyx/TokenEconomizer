@@ -247,8 +247,9 @@ def register(ctx):
         sid = str(session_id or "")
         p = base(sid)
         if p is not None:
-            _hook(dict(p, hook_event_name="SessionEnd", reason=str(reason or "")), FAST_S,
-                  platform or surface(sid))
+            with lock_for(sid):          # after any call of this session still in flight
+                _hook(dict(p, hook_event_name="SessionEnd", reason=str(reason or "")), FAST_S,
+                      platform or surface(sid))
         with locks_guard:
             locks.pop(sid, None)
         platforms.pop(sid, None)

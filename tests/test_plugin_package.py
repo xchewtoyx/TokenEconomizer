@@ -632,6 +632,31 @@ def test_a_finalized_hermes_subagent_is_forgotten(tmp_path, monkeypatch):
     assert [c["session_id"] for c in calls] == ["kid"]   # the id is no longer held
 
 
+def test_a_hermes_session_end_waits_for_a_tool_result_in_flight(tmp_path, monkeypatch):
+    import threading
+    import time
+    ctx = _HermesCtx(str(tmp_path))
+    shim = _load_hermes_shim()
+    order, started = [], threading.Event()
+
+    def fake_hook(p, *a):
+        if p["hook_event_name"] == "PostToolUse":
+            started.set()
+            time.sleep(0.3)
+        order.append(p["hook_event_name"])
+        return {}
+    monkeypatch.setattr(shim, "_hook", fake_hook)
+    shim.register(ctx)
+    t = threading.Thread(target=ctx.hooks["transform_tool_result"], kwargs=dict(
+        tool_name="terminal", args={"command": "ls"}, result="{}", session_id="s",
+        turn_id="t", status="ok"))
+    t.start()
+    started.wait(5)
+    ctx.hooks["on_session_finalize"](session_id="s", platform="cli")
+    t.join()
+    assert order == ["PostToolUse", "SessionEnd"]
+
+
 def test_the_hermes_bundle_is_a_plugin_directory_on_its_own(tmp_path):
     out = tmp_path / "market"
     subprocess.run([sys.executable, os.path.join(REPO, "scripts", "build_plugin.py"),
