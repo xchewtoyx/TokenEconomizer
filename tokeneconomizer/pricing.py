@@ -93,6 +93,9 @@ MODEL_WEIGHTS = {
 # stays green. Pin a base id.
 AGENT_DEFAULT_MODEL = {
     "codex": "gpt-5.6-sol",
+    # OpenClaw has no default model of its own (the person configures a provider), and its log
+    # names the model of every request, so a row is priced from that; None is the Claude curve.
+    "openclaw": None,
 }
 
 # Claude-family price ratios (Opus/Sonnet/Haiku share them). Used as the default when a

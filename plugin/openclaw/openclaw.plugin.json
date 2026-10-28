@@ -1,0 +1,9 @@
+{
+  "id": "tokeneconomizer",
+  "name": "TokenEconomizer",
+  "description": "Repository facts learned from earlier sessions, and a guard for turns stuck in a failing loop.",
+  "categories": ["developer-tools"],
+  "activation": { "onStartup": true },
+  "contracts": { "agentToolResultMiddleware": ["openclaw"] },
+  "configSchema": { "type": "object", "additionalProperties": false }
+}
