@@ -619,7 +619,9 @@ an OpenRouter rate limit is reported as **skipped**.
 **Running it.** Push to `claw-port` touching a port, `plugin/shared`, `plugin/scripts`,
 `tokeneconomizer/`, the driver or the workflow; or add the label `live-test` to a pull request
 into `claw-port` from a branch of this repository (re-add it to run again). A fork's pull
-request never runs it. A port not yet in the tree is skipped. `workflow_dispatch` works only
+request never runs it. A labelled pull request runs as `pull_request_target`: the workflow, the
+budget guard and the driver come from `claw-port` as it stands, and only the plugin and core
+under test (`plugin/`, `tokeneconomizer/`) from the pull request's head, checked out apart. A port not yet in the tree is skipped. `workflow_dispatch` works only
 once the workflow is on the default branch, which it is not meant to be. Only an allowlist is
 uploaded, as an artifact kept 7 days: `$TOKENECONOMIZER_HOME`, the driver's log of each session,
 Hermes' `state.db` and OpenClaw's session transcripts (`*.jsonl`); never agent config,
@@ -631,6 +633,10 @@ with yourself as a required reviewer, and move `OPENROUTER_API_KEY` into it as a
 secret. The job names that environment, so every run then waits for approval before it can read
 the key. Until the environment exists, GitHub creates it on the first run with no protection
 rules and no secrets, and the job runs unapproved with the repository secret.
+
+**Approve a `live` run only after reading the pull request's diff.** The plugin code under test
+runs inside the agent, whose environment carries the key, so approving a labelled pull request
+vouches for everything its diff changes under `plugin/` and `tokeneconomizer/`.
 
 **The model** is `z-ai/glm-5.3-flash`, overridable with the repository variable `LIVE_MODEL` (an
 OpenRouter model id). At run start the job checks that OpenRouter still lists it with `tools` in

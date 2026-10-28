@@ -14,7 +14,10 @@ on:
       - tokeneconomizer/**
       - scripts/live/**
       - .github/workflows/live-ports.yml
-  pull_request:
+  # `pull_request_target`, not `pull_request`: GitHub then runs this file as it is on
+  # `claw-port`, so a pull request cannot change these steps, the guard or the driver; only the
+  # plugin and core under test come from its head.
+  pull_request_target:
     branches: [claw-port]
     types: [labeled]
   workflow_dispatch:
@@ -43,11 +46,13 @@ jobs:
     # A pull request runs only when labelled `live-test`, and only from a branch of this
     # repository: a fork's head never reaches the step that holds the key.
     if: >-
-      github.event_name != 'pull_request' ||
+      github.event_name != 'pull_request_target' ||
       (github.event.label.name == 'live-test' &&
        github.event.pull_request.head.repo.full_name == github.repository)
     # The key belongs in this environment, with a required reviewer, so every run is approved
-    # first. Until the environment exists GitHub creates it empty and the job runs unprotected.
+    # first; approve a pull request's run only after reading its diff, since the plugin code
+    # under test runs inside the agent, whose environment carries the key. Until the
+    # environment exists GitHub creates it empty and the job runs unprotected.
     environment: live
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -57,13 +62,23 @@ jobs:
       matrix:
         platform: [hermes, openclaw]
     steps:
+      # The driver and every step's scripts: on a pull request, always the base branch.
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.base_ref || github.sha }}
+          persist-credentials: false
+
+      # The code under test (plugin/ and tokeneconomizer/): the pull request's head, or the push.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+          path: under-test
           persist-credentials: false
 
       - name: State under the runner's temp directory
         run: |
           {
+            echo "CODE=$GITHUB_WORKSPACE/under-test"
             echo "TOKENECONOMIZER_HOME=$RUNNER_TEMP/te-home"
             echo "HERMES_HOME=$RUNNER_TEMP/hermes-home"
             echo "LIVE_WORK=$RUNNER_TEMP/live-work"
@@ -80,7 +95,7 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: >-
           python scripts/live/ports.py guard --platform "${{ matrix.platform }}"
-          --model "$LIVE_MODEL" --budget "$LIVE_BUDGET_USD"
+          --model "$LIVE_MODEL" --budget "$LIVE_BUDGET_USD" --code "$CODE"
 
       # ---- Hermes: docs/ports/HERMES.md, plugin/README.md "Hermes Agent" ----
       - name: Install Hermes
@@ -106,7 +121,7 @@ jobs:
           agent:
             max_turns: 12
           EOF
-          ln -s "$GITHUB_WORKSPACE/plugin/hermes" "$HERMES_HOME/plugins/tokeneconomizer"
+          ln -s "$CODE/plugin/hermes" "$HERMES_HOME/plugins/tokeneconomizer"
           hermes plugins enable tokeneconomizer
           hermes plugins list || true
 
@@ -125,10 +140,10 @@ jobs:
           openclaw models set "openrouter/$LIVE_MODEL"
           # A cap on each request's output; OpenClaw has no turn or total-token cap.
           openclaw config set agents.defaults.params '{"maxTokens": 4096}'
-          openclaw plugins install --link "$GITHUB_WORKSPACE/plugin/openclaw" --accept-capabilities
+          openclaw plugins install --link "$CODE/plugin/openclaw" --accept-capabilities
           openclaw plugins enable tokeneconomizer
           openclaw config set plugins.entries.tokeneconomizer.hooks.allowConversationAccess true
-          plugin/scripts/te --host openclaw doctor || true
+          "$CODE/plugin/scripts/te" --host openclaw doctor || true
 
       - name: Five trap sessions and the assertions
         if: steps.guard.outputs.run == 'true'
@@ -137,7 +152,7 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: >-
           python scripts/live/ports.py run --platform "${{ matrix.platform }}"
-          --model "$LIVE_MODEL" --budget "$LIVE_BUDGET_USD" --work "$LIVE_WORK"
+          --model "$LIVE_MODEL" --budget "$LIVE_BUDGET_USD" --work "$LIVE_WORK" --code "$CODE"
           --reserve "${{ steps.guard.outputs.reserve }}"
 
       # Only what is listed here is uploaded: the plugin's state, the driver's logs of each

@@ -126,3 +126,45 @@ def test_the_watchdog_kills_the_agent_once_the_run_spends_its_trip(monkeypatch, 
     rc, why = ports.run_watched([sys.executable, "-c", "print('done')"], str(tmp_path), env,
                                 out, err, spent=lambda: 0.0, trip=0.25)
     assert (rc, why) == (0, None) and (tmp_path / "o").read_text() == "done\n"
+
+
+def test_a_zero_trip_lets_a_free_model_run_until_it_costs_money():
+    assert not ports.over_trip(0.0, 0.0) and ports.over_trip(0.0001, 0.0)
+    assert not ports.over_trip(0.1, 0.25) and ports.over_trip(0.25, 0.25)
+
+
+def _run(monkeypatch, tmp_path, reserve, totals):
+    """cmd_run with the agent and the fold stubbed: the key's all-time usage reads `totals` in
+    turn (the first read is the run's baseline). Returns (exit code, sessions started)."""
+    started = []
+    reads = iter(totals)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    monkeypatch.setenv("TOKENECONOMIZER_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    monkeypatch.setattr(ports, "key_usage", lambda key: (0.0, next(reads)))
+    monkeypatch.setattr(ports, "agent_cmd", lambda *a: ["true"])
+    monkeypatch.setattr(ports, "wait_folded", lambda *a, **k: {})
+    monkeypatch.setattr(ports, "check", lambda *a, **k: [("PASS", "stubbed")])
+
+    def watched(cmd, cwd, env, out, err, spent, trip):
+        started.append(trip)
+        open(out, "w").close()
+        open(err, "w").close()
+        return 0, None
+    monkeypatch.setattr(ports, "run_watched", watched)
+    rc = ports.main(["run", "--platform", "hermes", "--model", MODEL, "--work",
+                     str(tmp_path / "w"), "--reserve", str(reserve)])
+    return rc, started
+
+
+def test_a_session_that_ends_past_the_trip_stops_the_run_before_the_next(monkeypatch, tmp_path):
+    # baseline 1.00; session 1 ends with 0.30 spent, past the 0.25 trip of a 0.50 reserve
+    rc, started = _run(monkeypatch, tmp_path, 0.50, [1.0, 1.0, 1.30])
+    assert rc == 1 and started == [0.25]
+
+
+def test_a_free_model_runs_every_session_while_its_spend_stays_zero(monkeypatch, tmp_path):
+    rc, started = _run(monkeypatch, tmp_path, 0.0, [1.0] * 6)
+    assert rc == 0 and started == [0.0] * ports.SESSIONS
+    rc, started = _run(monkeypatch, tmp_path / "b", 0.0, [1.0, 1.0, 1.0, 1.01])
+    assert rc == 1 and len(started) == 2                 # it began to cost money: stopped

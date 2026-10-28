@@ -20,8 +20,9 @@ larger requests than it assumes), and OpenRouter reports spend with a lag. The o
 the weekly credit limit set on the key itself in OpenRouter.
 
 The key is read from OPENROUTER_API_KEY, sent only to openrouter.ai, and never printed.
-Standard library only; imports the plugin's own package for the trap repository and the hosts'
-transcript readers.
+Standard library only. `--code` names the tree under test (default: this script's own checkout).
+`guard` never imports from it; `run` imports its package for the trap repository and the hosts'
+transcript readers, since the plugin under test runs with the key in the agent anyway.
 """
 import argparse
 import glob
@@ -37,10 +38,16 @@ import time
 import urllib.error
 import urllib.request
 
+# The tree under test: the plugin and its core. `--code` sets it; the driver may come from another.
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, ROOT)
 
-from tokeneconomizer.plugin import hosts, probe  # noqa: E402
+
+def _plugin():
+    """(hosts, probe) from the tree under test, imported on first use (never by `guard`)."""
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    from tokeneconomizer.plugin import hosts, probe
+    return hosts, probe
 
 API = "https://openrouter.ai/api/v1"
 SESSIONS = 5
@@ -156,6 +163,7 @@ def cmd_guard(args):
 
 # ---- the scenario -------------------------------------------------------------------------
 def agent_cmd(platform, model, repo, work):
+    probe = _plugin()[1]
     if platform == "hermes":
         return ["hermes", "chat", "-q", probe.PROMPT, "-Q", "--provider", "openrouter",
                 "-m", model, "--max-turns", str(MAX_TURNS), "--yolo"]
@@ -212,7 +220,7 @@ def shell_commands(platform, transcript, work):
         return []
     tmp = tempfile.mkdtemp(dir=work)
     try:
-        path = hosts.HOSTS[platform]().mechanism_trace(transcript, tmp)
+        path = _plugin()[0].HOSTS[platform]().mechanism_trace(transcript, tmp)
     except Exception:  # noqa: BLE001 -- an unreadable log is reported, not fatal here
         return []
     cmds = []
@@ -259,6 +267,7 @@ def check(home, platform, work, allow_errors=(), folded_at_end=None):
     later = set(order[1:])
     injected = [e for e in events if e.get("kind") == "inject" and e.get("session_id") in later
                 and (e.get("chars") or 0) > 0]
+    probe = _plugin()[1]
     cmds = {sid: shell_commands(platform, sess[sid].get("transcript"), work) for sid in order}
     trapped = sum(1 for c in cmds.values() if probe.test_commands(c)[1])
     if injected:
@@ -297,6 +306,12 @@ def wait_folded(home, platform, before, timeout=FOLD_WAIT_S):
         time.sleep(2)
 
 
+def over_trip(spent, trip):
+    """Whether the run's spend so far has reached its trip point. A zero trip (a free model)
+    lets the run go on while it costs nothing and stops it at its first charge."""
+    return spent > trip if trip <= 0 else spent >= trip
+
+
 def run_watched(cmd, cwd, env, out_path, err_path, spent=None, trip=None,
                 timeout=SESSION_TIMEOUT_S):
     """Run one agent session, its output to files. Every WATCH_S, `spent()` (this run's spend so
@@ -320,7 +335,7 @@ def run_watched(cmd, cwd, env, out_path, err_path, spent=None, trip=None,
                 fails, now = fails + 1, None
             if fails >= 3:
                 why = "spend unknown: the key's usage could not be read"
-            elif now is not None and now >= trip:
+            elif now is not None and over_trip(now, trip):
                 why = f"run reserve reached (${now:.4f} spent, trips at ${trip:.4f})"
     try:
         os.killpg(proc.pid, signal.SIGKILL)
@@ -337,13 +352,13 @@ def cmd_run(args):
     work = os.path.abspath(args.work)
     logs = os.path.join(work, "transcripts")
     os.makedirs(logs, exist_ok=True)
-    repo, trap = probe.make_repo(work)
+    repo, trap = _plugin()[1].make_repo(work)
     # Micro-skills' free layer learns the trap's fact without a model call (as `te probe` runs).
     env = dict(os.environ, PATH=trap + os.pathsep + os.environ.get("PATH", ""),
                TE_MICROSKILLS="envfacts")
     key = os.environ.get("OPENROUTER_API_KEY")
     watch = bool(key) and not args.no_budget_check
-    if watch and not args.reserve:
+    if watch and args.reserve is None:
         raise SystemExit("run needs --reserve (the guard's `reserve` output)")
     start = key_usage(key)[1] if watch else 0.0
     spent = (lambda: key_usage(key)[1] - start) if watch else None
@@ -351,7 +366,12 @@ def cmd_run(args):
     at_end = {}
     for i in range(1, SESSIONS + 1):
         if watch:
-            week, _ = key_usage(key)
+            week, total = key_usage(key)
+            if over_trip(total - start, trip):
+                why = f"run reserve reached (${total - start:.4f} spent, trips at ${trip:.4f})"
+                _summary(f"**{args.platform}**: STOPPED before session {i}: {why}.")
+                print(f"::error::{args.platform}: stopped: {why}")
+                return 1
             if week is not None and week >= args.budget:
                 _summary(f"**{args.platform}**: STOPPED before session {i}: this week's spend "
                          f"${week:.4f} reached the ${args.budget:.2f} budget.")
@@ -399,6 +419,8 @@ def main(argv=None):
     ap.add_argument("--platform", required=True, choices=("hermes", "openclaw"))
     ap.add_argument("--model", required=True, help="an OpenRouter model id")
     ap.add_argument("--budget", type=float, default=2.00, help="dollars per UTC week, this key")
+    ap.add_argument("--code", default=None,
+                    help="the tree under test (default: this script's own checkout)")
     ap.add_argument("--work", default=None, help="run: the scratch directory")
     ap.add_argument("--reserve", type=float, default=None,
                     help="run: the guard's reserve in dollars; the watchdog trips at half of it")
@@ -407,6 +429,9 @@ def main(argv=None):
     ap.add_argument("--no-budget-check", action="store_true",
                     help="run: skip the between-session spend check (local stubbed runs only)")
     args = ap.parse_args(argv)
+    if args.code:
+        global ROOT
+        ROOT = os.path.abspath(args.code)
     if args.action == "guard":
         return cmd_guard(args)
     if not args.work:
