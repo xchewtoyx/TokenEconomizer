@@ -66,9 +66,17 @@ Notes:
 - **Why `SessionStart` is deferred.** `session_start` carries no workspace, and the core pins a
   session to a repository by its `cwd`. `before_prompt_build` is the first event that has
   `workspaceDir`, so the shim sends `SessionStart` there, followed by `UserPromptSubmit`.
-- **This is Pi's `prompt_context = True` pattern:** the facts are re-sent on every prompt. A
-  resumed session is given back the section it already carries, using Pi's
-  `carriedSection` logic. Reuse that function.
+- **This is Pi's `prompt_context = True` pattern:** the facts are re-sent on every prompt.
+- **Resume and reload: do not reuse Pi's `carriedSection`.**
+  - That function reads Pi's named system sections. OpenClaw's `appendSystemContext` text is
+    never stored as one, so on OpenClaw it would find nothing and drop the facts.
+  - Rely on the core instead. `OpenClaw` leaves `keeps_start_context = False`, so a
+    `SessionStart` with `source: "resume"` returns the text that session was first given. The
+    core stores it as `injected_text` in `sessions/<id>.json` (controller.py:116).
+  - The shim sends that `SessionStart` on the first `before_prompt_build` it sees for a
+    session. This covers a resumed session and the first prompt after a plugin reload, which
+    wipes the in-memory facts.
+  - Tests: resume and reload with a non-empty fact block must return the same text.
 - **Which directory counts.** By default `workspaceDir` is the persona home
   (`~/.openclaw/workspace`), not a repository [V]. Sessions can run in a registered project
   checkout or a worktree [V]. The `cwd` sent to the core is chosen in this order:
@@ -109,6 +117,7 @@ Notes:
 class OpenClaw(Host):
     name = "openclaw"
     prompt_context = True        # the shim re-appends the facts every prompt
+    keeps_start_context = False  # resume and reload get the stored injected_text back (§2)
     relays_notices = False       # [?] depends on §9.4
     interrupt = "..."            # [?]
     end_run = "..."
@@ -164,6 +173,13 @@ already are: session version 4 [V]):
   entry is `{"type":"message","id":…,"parentId":<previous id>,"timestamp":…,"message":m}`. The
   `parentId` chain is required: `trace.pi_active_branch` walks it from the last entry
   (`tokeneconomizer/trace/pi.py:31`). Messages already written (tracked by count) are skipped.
+- **Tool names are normalized as they are written.** Each `toolCall` block's `name` gets the
+  §3 mapping (`exec`/`bash` → `bash` with `arguments.command`, and so on) before it lands in
+  the log. `pi_session_to_claude` copies names unchanged, and the micro-skill observer reads
+  only `bash`/`shell` (`microskills/observe.py`). An `exec` left as `exec` would teach the fold
+  nothing, even though the live loop guard saw it as `bash`.
+  - The live payload's `tool_name` is left as OpenClaw sent it; only the log is renamed.
+  - `toolResult.toolName` is renamed to match.
 - **Usage.** It is read from the assistant messages' `usage{input, output, cacheRead,
   cacheWrite, cost}`, the fields `pi_session_usage` already reads. Check that against a
   recorded session [?]. If assistant messages lack usage, record `llm_output` usage as extra
@@ -255,7 +271,11 @@ OpenClaw config changes.
 - **`test_live_hooks.py`:**
   - the `_guard_turn` / `_stuck` shapes and the parametrized guard test gain `openclaw`;
   - a five-trap-session end-to-end test reusing `_pi_session`. The log is the same format,
-    written the way the shim writes it: linear `parentId` chain, no tree branches.
+    written the way the shim writes it: linear `parentId` chain, no tree branches, tool names
+    already normalized. It asserts a shell observation from a trap `exec` call that reached
+    the fold, not only a loop-guard result;
+  - resume and plugin reload with a non-empty fact block: the second `SessionStart`
+    (`source: "resume"`) returns the first one's text.
 - **`test_plugin_package.py`:**
   - `openclaw.plugin.json` and `package.json` agree on the entry, and the contracts block is
     present;

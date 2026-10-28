@@ -139,6 +139,16 @@ writer.
 - **Compacted turns.** Hermes compacts in place and marks old rows `active=0, compacted=1`
   [SRC]. Learning reads the whole session: `active=1 OR compacted=1`. The prompt count reads
   `active=1` only, like Pi's active branch. Settle this with a recorded compacted session.
+- **Pending folds need a liveness check that understands this path.**
+  `fold.pending_sessions` (fold.py:427) calls `os.path.getmtime` on the stored transcript. A
+  `state.db#<id>` string never stats, so a session whose finalize hook was missed would never
+  fold. The database file's mtime would not help either: other sessions keep writing to it.
+  - Add `Host.last_activity(transcript_path)`. Its default is `os.path.getmtime`, and
+    `pending_sessions` calls it instead of `getmtime`.
+  - `Hermes` overrides it: `sessions.ended_at` if set, else the newest `messages.timestamp` for
+    that session id. A missing row counts as never active.
+  - Tests: a Hermes session with no end event and an old last message is picked up by
+    `pending_sessions`; one with a recent message is not.
 - **`settle()`.** On `on_session_finalize`, wait (bounded at 2 s) until `sessions.ended_at` is
   set, like Copilot's wait for `session.shutdown`.
 

@@ -46,6 +46,7 @@ Fold-time needs, per host:
 | # | Place | What to add |
 |---|---|---|
 | 1 | `tokeneconomizer/plugin/hosts.py` | a `Host` subclass; an entry in `HOSTS` (line 440); `default_host` env markers; `detect` hints |
+| 1a | `tokeneconomizer/plugin/fold.py` | only if the host's `transcript_path` is not a plain file (Hermes): `pending_sessions` asks `Host.last_activity` instead of calling `os.path.getmtime` |
 | 2 | `tokeneconomizer/trace/<host>.py` + `trace/__init__.py` | the log reader: `*_session_to_claude` (or reuse Pi's), `*_prompt_count`, `*_session_usage` |
 | 3 | `tokeneconomizer/plugin/sidecall.py` | `<host>_call` and a branch in `runner_for` (line 270); a stub in `tests/conftest.py` |
 | 4 | `tokeneconomizer/plugin/controller.py` | a `_cmd` branch (line 64), so notices name the host's own `/te` command |
