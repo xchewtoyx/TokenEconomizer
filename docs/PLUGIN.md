@@ -498,7 +498,8 @@ re-running the test and found the missing fixture. With every run piped (`npm te
 * **Verified (the release, no model):** `openclaw plugins install --link plugin/openclaw
   --accept-capabilities`, `enable` and `config set …allowConversationAccess true` load it with
   no diagnostics; `plugins inspect --runtime` lists the four hooks, the command and the
-  middleware contract, with `rootDir` the linked directory. `te --host openclaw doctor` read the
+  middleware contract, with `rootDir` the linked directory. Without a terminal to ask on (CI),
+  the install also needs `--force`, or it is cancelled as a local, unreviewed source. `te --host openclaw doctor` read the
   version and the grant. The side call's `agent exec` accepted the tool-denying config and
   stopped only for want of a model login. The release's `agent exec` has no
   `--config-override`, which the source has; the side call falls back to a config file that

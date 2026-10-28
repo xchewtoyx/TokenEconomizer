@@ -342,12 +342,13 @@ place (it reaches the launchers in `plugin/scripts` and the core through `plugin
 
 ```bash
 git clone https://github.com/microsoft/TokenEconomizer
-openclaw plugins install --link ./TokenEconomizer/plugin/openclaw --accept-capabilities
+openclaw plugins install --link ./TokenEconomizer/plugin/openclaw --accept-capabilities --force
 openclaw plugins enable tokeneconomizer
 openclaw config set plugins.entries.tokeneconomizer.hooks.allowConversationAccess true
 ```
 
-`--accept-capabilities` (or `--force`) is the consent OpenClaw asks for on a linked plugin. The
+`--accept-capabilities` accepts the capabilities the plugin asks for, and `--force` confirms a
+plugin from a local path, which OpenClaw otherwise cancels when it cannot ask you. The
 last line is required: without it the plugin can neither add the facts to a prompt nor log a
 turn. OpenClaw refuses a plugin directory that is world-writable or owned by anyone but the
 gateway's user or root ("suspicious ownership"), so keep the clone owned by that user.

@@ -263,7 +263,8 @@ openclaw config set plugins.entries.tokeneconomizer.hooks.allowConversationAcces
   `test_plugin_package.py` pins root and `plugin/` to agree, as it does for Pi.
 - **Development.** For local development, `openclaw plugins install --link ./plugin/openclaw`.
 - **Capability consent.** It is shown at install. Non-interactive installs need
-  `--accept-capabilities` [V].
+  `--accept-capabilities` [V], and a linked local path also needs `--force`, or the install is
+  cancelled as outside ClawHub review [V: live run 40772314518].
 - **Python.** The plugin needs `python3` on the gateway host. `te doctor` already checks for it.
 
 ## 8. Tool pruning (phase 2)
