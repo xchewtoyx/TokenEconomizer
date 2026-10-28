@@ -15,6 +15,9 @@
  *   agent_end                                -> the turn's messages join this plugin's own
  *                                               session log (Pi format), then Stop
  *   session_end                              -> SessionEnd, which hands the segment to a fold
+ *   process exit, in `openclaw agent exec`    -> SessionEnd (reason "exit"): a one-shot exec run
+ *                                               fires no `session_end` and exits right after it
+ *                                               prints, so its Stop and end are sent blocking
  *
  * An OpenClaw session can last for days (a chat keeps its session), while the dispatcher folds a
  * session once, after it has been quiet for `fold.STALE_S`. So the dispatcher is shown segments:
@@ -35,7 +38,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realp
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { disabled, hookOutput, runLauncher } from "./te-spawn.ts";
+import { disabled, hookOutput, runLauncher, runLauncherSync } from "./te-spawn.ts";
 
 const HOST = "openclaw";
 // Below OpenClaw's own budgets (before_prompt_build 15 s, agent_end 30 s), which do not cancel a
@@ -50,6 +53,25 @@ const COMMAND_MS = 60_000;
 export const QUIET_MS = 540_000;
 // How long a segment change waits for the old segment's last `agent_end` to log its run.
 const ENDING_WAIT_MS = 5_000;
+// How long an exec run's exit waits for its SessionEnd (which only hands off a detached fold).
+const EXIT_MS = 5_000;
+
+/** Whether this process is a one-shot `openclaw agent exec`: OpenClaw's own test
+ * (`isAgentExecInvocation`) reads the command path `agent exec` from argv, and so does this. No
+ * hook context, env var or channel marks such a run (`OPENCLAW_SHELL=exec` is set only for the
+ * exec tool's child commands). The gateway's argv never reads so. */
+export function oneShotExec(argv: string[] = process.argv): boolean {
+  // shortcut: an option value spelled `exec` (`openclaw agent --local -m exec`) also counts; that
+  // run is one-shot too, so it is only ended at its exit rather than by the sweep.
+  const args = argv.slice(2), words: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (ROOT_VALUE_OPTIONS.has(args[i])) i++; // `--profile work agent exec`: `work` is no command
+    else if (!args[i].startsWith("-")) words.push(args[i]);
+  }
+  return words[0] === "agent" && words.includes("exec");
+}
+// The root options that take a separate value (OpenClaw's `getRootOptionAwareCommandPath`).
+const ROOT_VALUE_OPTIONS = new Set(["--profile", "--log-level", "--container"]);
 
 // The names the dispatcher's mechanisms read (`loopguard/state.canon_tool`, `microskills/observe`).
 export const TOOL_NAMES: Record<string, string> = {
@@ -279,6 +301,30 @@ export default {
       return hookOutput(out);
     }
 
+    /** `hook`, blocking, for an exec run whose process may exit at any moment after its run. */
+    function hookSync(s: { seg: string; cwd: string; channel: string }, payload: Record<string, unknown>, ms: number): any {
+      if (disabled()) return {};
+      const body = { session_id: s.seg, transcript_path: logPath(s.seg), cwd: s.cwd, ...payload };
+      return hookOutput(runLauncherSync(join(scripts, "te-hook"), ["--host", HOST], JSON.stringify(body), { TE_OPENCLAW_CHANNEL: s.channel }, ms));
+    }
+
+    // An exec run's sessions end when its process does: after every `agent_end` it got.
+    const exec = oneShotExec();
+    if (exec) {
+      process.once("exit", () => {
+        // A run whose `agent_end` never logged it is gone with this process; nothing can add it
+        // later, so the session still ends, with a line saying what it lacks.
+        const open = [...runs.values()].length;
+        if (open) errorLine(`openclaw: exec exited with ${open} run(s) not yet logged`);
+        for (const s of sessions.values()) {
+          try {
+            hookSync(s, { hook_event_name: "SessionEnd", reason: "exit" }, EXIT_MS);
+          } catch {}
+        }
+        sessions.clear();
+      });
+    }
+
     const starting = new Map<string, Promise<Session | undefined>>();
     // Runs that opened a turn and whose `agent_end` has not logged them yet: a segment is ended
     // only once its runs are in its log (or ENDING_WAIT_MS has passed).
@@ -451,7 +497,10 @@ export default {
             runs.delete(key);
             run?.logged();
           }
-          await hook(s, { hook_event_name: "Stop", prompt_id: run?.turn ?? s.turn, stop_hook_active: false }, END_MS);
+          const stop = { hook_event_name: "Stop", prompt_id: run?.turn ?? s.turn, stop_hook_active: false };
+          // OpenClaw does not wait for `agent_end` handlers before an exec run exits.
+          if (exec) hookSync(s, stop, END_MS);
+          else await hook(s, stop, END_MS);
         } catch {}
         return undefined;
       },

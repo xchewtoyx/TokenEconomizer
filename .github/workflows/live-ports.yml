@@ -98,16 +98,22 @@ jobs:
           --model "$LIVE_MODEL" --budget "$LIVE_BUDGET_USD" --code "$CODE"
 
       # ---- Hermes: docs/ports/HERMES.md, plugin/README.md "Hermes Agent" ----
+      # Hermes refuses to build a wheel (its setup.py); it ships through its shell installer,
+      # which is taken from the pinned commit and installs that commit (its own Python 3.14 via
+      # uv, its locked dependencies). No secret is in this step's environment.
       - name: Install Hermes
         if: steps.guard.outputs.run == 'true' && matrix.platform == 'hermes'
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
-          python -m venv "$RUNNER_TEMP/hermes-venv"
-          "$RUNNER_TEMP/hermes-venv/bin/pip" install --quiet \
-            "hermes-agent @ git+https://github.com/NousResearch/hermes-agent@$HERMES_REF"
+          curl -fsSL -o "$RUNNER_TEMP/hermes-install.sh" \
+            "https://raw.githubusercontent.com/NousResearch/hermes-agent/$HERMES_REF/scripts/install.sh"
+          bash "$RUNNER_TEMP/hermes-install.sh" --commit "$HERMES_REF" \
+            --dir "$RUNNER_TEMP/hermes-agent" --hermes-home "$HERMES_HOME" \
+            --non-interactive --skip-browser --skip-computer-use
           mkdir -p "$RUNNER_TEMP/bin" "$HERMES_HOME/plugins"
-          ln -s "$RUNNER_TEMP/hermes-venv/bin/hermes" "$RUNNER_TEMP/bin/hermes"
+          ln -s "$RUNNER_TEMP/hermes-agent/.hermes/bin/hermes" "$RUNNER_TEMP/bin/hermes"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/hermes" --version
 
       - name: Configure Hermes and install the plugin
         if: steps.guard.outputs.run == 'true' && matrix.platform == 'hermes'

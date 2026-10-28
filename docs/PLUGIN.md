@@ -487,7 +487,7 @@ steering message (a `custom_message` of type `tokeneconomizer`), after which it 
 re-running the test and found the missing fixture. With every run piped (`npm test 2>&1 | tail
 -n 8`), each counted as failing and the judge found the turn stuck (0.90).
 
-**OpenClaw 2026.10.8 — read from source, loaded but not yet run with a model** (source at
+**OpenClaw 2026.10.8 — read from source, and run with a model in the live test** (source at
 `openclaw/openclaw@4a0ab09`, the npm release `dc2523e`; the spec and its citations are in
 [`ports/OPENCLAW.md`](ports/OPENCLAW.md)):
 
@@ -520,6 +520,22 @@ re-running the test and found the missing fixture. With every run piped (`npm te
   `appendSystemContext` may change at that boundary, after a gap longer than a provider's prompt
   cache lasts. Logs in that shape taught the missing-`pytest`
   fact over four sessions, injected at the fifth session's start.
+* **Verified (live run 40774930744, `openclaw agent exec` on `z-ai/glm-5.3-flash` through
+  OpenRouter, five trap sessions):** every session was recorded and priced, its log written and
+  folded, the fact injected at a later session's start, and `errors.log` stayed empty. But `agent
+  exec` never fires `session_end`: each session folded only when the driver ran `te fold`. The
+  source (`v2026.10.8`, `dc2523e`) agrees: `session_end` comes only from the gateway (a reset or
+  delete, its shutdown drain), a reply's session rollover and compaction; `agentExecCommand`
+  (`src/commands/agent-exec.ts`) runs one turn with `oneShotCliRun: true` and fires no session or
+  gateway hook. It then exits (`requestExitAfterOneShotOutput`, `process.exit` once stdout and
+  stderr drain) without waiting for `agent_end` handlers, which the embedded runner starts
+  unawaited (`runAgentEndSideEffectsAsync`). No hook context, env var or channel marks an exec
+  run: `OPENCLAW_SHELL=exec` is set only for the exec tool's child commands
+  (`bash-tools.exec-runtime.ts`), and the `oneShotCliRun` flag reaches tool factories, not hooks.
+  OpenClaw itself tells an exec run by its argv command path (`isAgentExecInvocation`), and so
+  does the plugin (`oneShotExec`): in that process it sends Stop blocking from `agent_end` and
+  SessionEnd (`reason: "exit"`) for each session from the process's `exit` event, never in the
+  gateway. A Node test drives that path; the next live run checks it.
 * **Unverified:** everything a model turn shows — that the middleware's appended text is what
   the model reads, notices, usage on real `agent_end` messages, `/te` inside a chat, the side
   call's answer, and the `git:` install of the repository root (whose `npm install` also fetches
@@ -642,7 +658,7 @@ open-vocabulary. On a repository you do not trust, leave micro-skills off (the d
   already found its cause and was working around it; since 2026-10-25 the judge decides every
   redirect but the backstop's, which still counts.
 * **Pi** — tool pruning is not planned there, since Pi declares only four tools by default.
-* **OpenClaw** — not yet run with a model (§3). Tool pruning is phase 2 (`toolsAllow`). A
+* **OpenClaw** — run with a model only through `openclaw agent exec` (§3). Tool pruning is phase 2 (`toolsAllow`). A
   session whose workspace is not a git checkout joins its repository from its second prompt.
   The plugin's own session logs (`$TOKENECONOMIZER_HOME/hosts/openclaw/sessions/`, default
   `~/.tokeneconomizer/hosts/openclaw/sessions/`) are kept after the fold, with their
@@ -672,7 +688,9 @@ five sessions in `te probe`'s throwaway repository, where bare `pytest` is missi
 `python -m unittest` works (`scripts/live/ports.py`; it lives beside `scripts/build_plugin.py`,
 not under `experiments/`, because it tests the plugin, not a benchmark arm). Hermes runs
 `v0.22.5` (`hermes chat -q … --max-turns 12`; the earlier `v2026.9.24` tag lacks the
-`PluginContext` methods the shim calls), OpenClaw `2026.10.8` (`openclaw agent exec`, which has
+`PluginContext` methods the shim calls), installed by its own shell installer taken from that
+commit (`scripts/install.sh --commit … --non-interactive --skip-browser --skip-computer-use`),
+since its `setup.py` refuses to build a wheel for `pip install`, OpenClaw `2026.10.8` (`openclaw agent exec`, which has
 no turn limit: its timeout and a 4096-token cap on each request's output bound it). Each is set up as `plugin/README.md` describes, with
 `microskills=envfacts` (no model call to learn) and `TOKENECONOMIZER_HOME` under
 `$RUNNER_TEMP`. The job then checks, from the plugin's own state:
