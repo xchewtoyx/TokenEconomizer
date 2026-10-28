@@ -6,7 +6,8 @@ standard-library-only package `tokeneconomizer`:
 
 - `tokeneconomizer.trace` is the one place a saved session log is read (`load_trajectory`,
   `call_cwds`, `tool_usage`, `parse_catalog`), with one module per agent's format. A new agent
-  needs a reader here and nothing else.
+  needs a reader here and nothing else (OpenClaw's plugin writes its log in Pi's format, so it
+  needs none).
 - `tokeneconomizer.ledger` and `tokeneconomizer.pricing` are the one definition of cost.
   Mechanisms record their per-task overhead (in the plugin, a session counts as one task); the
   plugin's session ledger and the experiments' aggregation read it back through the same modules,

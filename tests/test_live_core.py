@@ -241,6 +241,10 @@ def test_host_detection():
     # session started from inside Copilot inherits the marker but always sends a transcript.
     copilot_env = {"COPILOT_PLUGIN_ROOT": "/p", "COPILOT_CLI": "1"}
     assert hosts.detect({"session_id": "s"}, copilot_env).name == "copilot"
+    # OpenClaw's log is the one its plugin writes under the state root.
+    assert hosts.detect({"transcript_path": "/h/.tokeneconomizer/hosts/openclaw/sessions/s.jsonl"}
+                        ).name == "openclaw"
+    assert hosts.detect({"turn_id": "t"}, hint="openclaw").name == "openclaw"
     assert hosts.detect({"session_id": "s", "transcript_path": "/h/.claude/projects/x/s.jsonl"},
                         copilot_env).name == "claude"
     assert hosts.detect({"session_id": "s"}, {}).name == "claude"
@@ -501,6 +505,80 @@ def test_a_hermes_session_with_no_end_is_folded_once_it_goes_quiet(tmp_path):
                                                  "transcript": tp})
     assert fold.pending_sessions(ctx, now=now) == ["old"]
     assert ctx.host.last_activity(f"{db}#recent") == pytest.approx(now - 60)
+def test_the_openclaw_host_reads_what_the_shim_sends():
+    h = hosts.HOSTS["openclaw"]()
+    # A failed exec: PostToolUseFailure with the result in Pi's shape, the exit code from
+    # `details.exitCode`, and the payload's own `error` left unread.
+    name, args, text, code = h.tool_call({
+        "hook_event_name": "PostToolUseFailure", "tool_name": "exec",
+        "tool_input": {"command": "pytest -q", "workdir": "pkg"}, "error": "Exit code 9",
+        "tool_response": {"content": "E   ImportError: no module named x", "isError": True,
+                          "exit_code": 2}})
+    assert (name, args, code) == ("bash", {"command": "pytest -q"}, 2) and "ImportError" in text
+    assert h.tool_call({"tool_name": "read", "tool_input": {"path": "a.py"},
+                        "tool_response": {"content": "x", "isError": False}})[:2] == (
+        "view", {"path": "a.py"})
+    assert h.tool_call({"tool_name": "web_fetch", "tool_input": {"url": "u"},
+                        "tool_response": {"content": "", "isError": False}})[0] == "web_fetch"
+    assert h.turn_key({"prompt_id": "s:run1"}) == "s:run1"
+    assert h.headless({}) and not h.headless({"TE_OPENCLAW_CHANNEL": "webchat"})
+    assert not h.keeps_start_context and h.prompt_context
+    assert hosts.default_host({"OPENCLAW_SHELL": "exec"}) == "openclaw"
+
+
+@pytest.mark.real_sidecalls
+def test_an_openclaw_side_call_is_a_tool_less_agent_exec(monkeypatch):
+    import subprocess
+
+    from tokeneconomizer.plugin import sidecall
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen.update(cmd=cmd, input=kw.get("input"), env=kw.get("env"))
+        out = json.dumps({"ok": True, "status": "ok", "final": "- use python -m pytest",
+                          "usage": {"input": 100, "output": 20, "cacheRead": 50, "cacheWrite": 0},
+                          "model": "anthropic/claude-haiku-4.5"})
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(sidecall.subprocess, "run", fake_run)
+    text, eff = sidecall.openclaw_call("propose facts", model="openrouter/x")
+    assert text == "- use python -m pytest" and eff and eff > 0
+    cmd = seen["cmd"]
+    assert cmd[:4] == ["openclaw", "agent", "exec", "--json"] and seen["input"] == "propose facts"
+    assert json.loads(cmd[cmd.index("--config-override") + 1]) == {"tools": {"deny": ["*"]}}
+    assert cmd[cmd.index("--model") + 1] == "openrouter/x" and "--cwd" in cmd
+    assert seen["env"]["TE_SIDECALL"] == "1"
+    cfg = live_config.LiveConfig()
+    assert sidecall.runner_for("openclaw", cfg).__code__.co_names.count("openclaw_call") == 1
+
+
+@pytest.mark.real_sidecalls
+def test_an_openclaw_without_config_override_denies_tools_through_an_including_config(
+        tmp_path, monkeypatch):
+    """`agent exec` as published in 2026.10.8 has no `--config-override`: the deny goes in a
+    config beside the person's that includes it (`$include` reads only from that directory),
+    removed afterwards."""
+    import subprocess
+
+    from tokeneconomizer.plugin import sidecall
+    conf = tmp_path / "openclaw.json"
+    conf.write_text("{}")
+    seen = []
+
+    def fake_run(cmd, **kw):
+        if cmd[1:] == ["config", "file"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=f"{conf}\n", stderr="")
+        if "--config-override" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr=(
+                'OpenClaw does not recognize option "--config-override".'))
+        path = cmd[cmd.index("--config") + 1]
+        seen.append((os.path.dirname(path), json.load(open(path))))
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"ok": True, "final": "hi"}),
+                                           stderr="")
+    monkeypatch.setattr(sidecall.subprocess, "run", fake_run)
+    assert sidecall.openclaw_call("p")[0] == "hi"
+    assert seen == [(str(tmp_path), {"$include": "./openclaw.json", "tools": {"deny": ["*"]}})]
+    assert os.listdir(tmp_path) == ["openclaw.json"]
 
 
 # ---- the guard sees edits made through the shell ---------------------------------------------

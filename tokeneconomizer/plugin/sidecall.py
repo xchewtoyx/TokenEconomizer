@@ -29,6 +29,8 @@ so no extra API key is needed and the call is billed where the session is:
     memory or preloaded skills) and `--usage-file`, whose JSON report carries the run's tokens.
     Hermes has no "no tools" switch; `-t context_engine` enables only the context engine's own
     toolset, which the built-in engine leaves empty (unverified on a running Hermes).
+  * OpenClaw: `openclaw agent exec --json` with every tool denied, in a neutral cwd and a
+    throwaway state directory, on the person's configured default model unless `paid_model`.
 
 Every side call runs with `TE_SIDECALL=1`, which the plugin's hook entry point treats as "do
 nothing": without it the nested agent would run this plugin's hooks and recurse. A call that
@@ -298,6 +300,67 @@ def hermes_call(prompt, model="", cli="hermes", timeout=TIMEOUT_S):
     return text, eff
 
 
+# Every tool denied, for one run; the person's providers and logins still apply.
+OPENCLAW_NO_TOOLS = json.dumps({"tools": {"deny": ["*"]}})
+
+
+def _openclaw_no_tools_config(cli):
+    """For an `agent exec` without `--config-override` (2026.10.8 as published): a config file
+    that includes the person's own and denies every tool. It must sit in the config's directory,
+    which is all `$include` may read. Its path, or None when none can be written."""
+    try:
+        path = subprocess.run([cli, "config", "file"], capture_output=True, text=True, timeout=60,
+                              env=_env(), stdin=subprocess.DEVNULL).stdout.strip().splitlines()[-1]
+        fd, tmp = tempfile.mkstemp(prefix=".te-sidecall-", suffix=".json",
+                                   dir=os.path.dirname(path))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(dict({"$include": "./" + os.path.basename(path)} if os.path.exists(path)
+                           else {}, **json.loads(OPENCLAW_NO_TOOLS)), fh)
+        return tmp
+    except (OSError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def openclaw_call(prompt, model="", cli="openclaw", timeout=TIMEOUT_S):
+    """`openclaw agent exec`: one embedded turn without the gateway, in a throwaway state
+    directory, with the prompt on stdin. It loads the person's installed plugins in its own
+    process, so this plugin sees `TE_SIDECALL=1` there and stays out of it."""
+    cmd = [cli, "agent", "exec", "--json", "--message-file", "-", "--timeout", str(int(timeout))]
+    if model:
+        cmd += ["--model", model]
+    with tempfile.TemporaryDirectory(prefix="te-side-") as cwd:
+        def run(*extra):
+            return subprocess.run(cmd + ["--cwd", cwd, *extra], input=prompt, capture_output=True,
+                                  text=True, timeout=timeout + 30, env=_env(), cwd=cwd)
+        out = run("--config-override", OPENCLAW_NO_TOOLS)
+        if 'recognize option "--config-override"' in (out.stderr or "") + (out.stdout or ""):
+            conf = _openclaw_no_tools_config(cli)
+            if conf:                      # never without the deny: a model could run commands
+                try:
+                    out = run("--config", conf)
+                finally:
+                    os.remove(conf)
+    try:
+        data = json.loads(out.stdout or "{}")
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    text = (data.get("final") or "") if data.get("ok") else ""
+    if not text:
+        _no_reply("openclaw", out)
+    eff = None
+    u = data.get("usage")
+    if isinstance(u, dict):
+        eff, _ = accounting.effective({
+            "input_tokens": int(u.get("input") or 0),
+            "cache_read_input_tokens": int(u.get("cacheRead") or 0),
+            "cache_creation_input_tokens": int(u.get("cacheWrite") or 0),
+            "output_tokens": int(u.get("output") or 0),
+            "model": data.get("model") or model or "openclaw"})
+    return text, eff
+
+
 def runner_for(host_name, config):
     """The optimizer callable for this host. Each host's calls go through that host's own CLI,
     never another agent's. The caller decides whether a call is allowed: micro-skills' proposer
@@ -311,4 +374,6 @@ def runner_for(host_name, config):
         return lambda prompt, _m="agent": copilot_call(prompt, model=model)
     if host_name == "hermes":
         return lambda prompt, _m="agent": hermes_call(prompt, model=model)
+    if host_name == "openclaw":
+        return lambda prompt, _m="agent": openclaw_call(prompt, model=model)
     return lambda prompt, _m="agent": claude_call(prompt, model=model or "haiku")

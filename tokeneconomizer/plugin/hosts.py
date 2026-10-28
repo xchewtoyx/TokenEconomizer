@@ -352,6 +352,63 @@ class Pi(Host):
         return trace.pi_session_usage(transcript_path)
 
 
+# OpenClaw's tool names, as the mechanisms know them (its shim renames the session log the same way).
+_OPENCLAW_TOOLS = {"exec": "bash", "bash": "bash", "read": "view", "edit": "edit",
+                   "apply_patch": "edit", "write": "create"}
+
+
+class OpenClaw(Host):
+    """OpenClaw (openclaw/openclaw), through the native plugin in `plugin/openclaw/`.
+
+    Like Pi's extension, the plugin speaks this protocol on OpenClaw's behalf, and it keeps the
+    session log itself: OpenClaw's own store is SQLite with zstd-compressed events, which the
+    standard library cannot read before Python 3.14. So the log is in Pi's session format,
+    written on `agent_end` with tool names already renamed, and read with Pi's readers. What
+    the plugin sends:
+
+      * `prompt_id`, `<session>:<run id>`, for the turn identity OpenClaw does not stamp;
+      * `tool_response = {content, isError, exit_code}`, `exit_code` from the exec result's
+        `details.exitCode`;
+      * the turn's channel in `TE_OPENCLAW_CHANNEL`.
+    """
+    name = "openclaw"
+    prompt_context = True              # the plugin returns the facts as `appendSystemContext`
+    # A resumed session, or the first prompt after a plugin reload, gets back the text it was
+    # first given (`injected_text`): OpenClaw keeps no copy of `appendSystemContext`.
+    keeps_start_context = False
+    # A plugin has no way to show the person a notice (only the gateway log), so the loop
+    # guard's still-stuck notice also goes through the model.
+    relays_notices = True
+    interrupt = "Send /stop to stop it."
+    end_run = "Press Ctrl+C to end the run."
+
+    def turn_key(self, p):
+        return str(p.get("prompt_id") or "")
+
+    def headless(self, env, transcript=None):
+        # The terminal UI and the Control UI both send through the `webchat` channel, and a
+        # messaging channel names itself; a run with no channel has no conversation to stop in.
+        return not str(env.get("TE_OPENCLAW_CHANNEL", "")).strip()
+
+    def tool_call(self, p):
+        name, args, text, code = super().tool_call(p)
+        canon = _OPENCLAW_TOOLS.get(name.lower(), name)
+        if canon == "bash":
+            return "bash", {"command": str(args.get("command") or "")}, text, code
+        return canon, args, text, code
+
+    def mechanism_trace(self, transcript_path, workdir):
+        out = os.path.join(workdir, "openclaw_trace.jsonl")
+        n = trace.pi_session_to_claude(transcript_path, out)
+        return out if n is not None else None
+
+    def prompt_count(self, transcript_path):
+        return trace.pi_prompt_count(transcript_path)
+
+    def session_usage(self, transcript_path):
+        return trace.pi_session_usage(transcript_path)
+
+
 def copilot_home(env=None):
     env = os.environ if env is None else env
     return env.get("COPILOT_HOME") or os.path.join(os.path.expanduser("~"), ".copilot")
@@ -521,7 +578,7 @@ def _ancestor_args(limit=4):
 
 
 HOSTS = {"claude": ClaudeCode, "codex": Codex, "copilot": Copilot, "pi": Pi,
-         "hermes": Hermes}
+         "hermes": Hermes, "openclaw": OpenClaw}
 
 
 def default_host(env=None, recent=None):
@@ -536,6 +593,8 @@ def default_host(env=None, recent=None):
         return "claude"
     if env.get("COPILOT_CLI") == "1":
         return "copilot"
+    if env.get("OPENCLAW_SHELL") == "exec":     # set on OpenClaw's exec tool's shell
+        return "openclaw"
     return recent if recent in HOSTS else "claude"
 
 
@@ -552,6 +611,8 @@ def detect(payload, env=None, hint=None):
         return Codex()
     if f"{os.sep}session-state{os.sep}" in tp and tp.endswith("events.jsonl"):
         return Copilot()
+    if f"{os.sep}hosts{os.sep}openclaw{os.sep}sessions{os.sep}" in tp:
+        return OpenClaw()
     # Claude Code always sends a transcript path; Copilot sends none before Stop, and marks its
     # hook processes. (Hooks inherit the parent's environment, so the marker alone would also
     # tag a Claude Code session started from inside Copilot -- hence the transcript test first.)

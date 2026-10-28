@@ -1,0 +1,193 @@
+# The model-backed live test of the Hermes and OpenClaw ports (docs/PLUGIN.md §6).
+# Runs the agents' own CLIs on OpenRouter, behind a weekly budget guard. Run outputs are uploaded
+# as short-lived artifacts and never committed.
+name: live-ports
+
+on:
+  push:
+    branches: [claw-port]
+    paths:
+      - plugin/hermes/**
+      - plugin/openclaw/**
+      - plugin/shared/**
+      - plugin/scripts/**
+      - tokeneconomizer/**
+      - scripts/live/**
+      - .github/workflows/live-ports.yml
+  # `pull_request_target`, not `pull_request`: GitHub then runs this file as it is on
+  # `claw-port`, so a pull request cannot change these steps, the guard or the driver; only the
+  # plugin and core under test come from its head.
+  pull_request_target:
+    branches: [claw-port]
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      model:
+        description: OpenRouter model id (default vars.LIVE_MODEL, else the pinned one below)
+        required: false
+
+permissions:
+  contents: read
+
+# One run at a time, across every trigger: the budget guard reads spend that a concurrent run
+# would not have reported yet.
+concurrency:
+  group: live-ports
+  cancel-in-progress: false
+
+env:
+  LIVE_MODEL: ${{ inputs.model || vars.LIVE_MODEL || 'z-ai/glm-5.3-flash' }}
+  LIVE_BUDGET_USD: "2.00"
+  HERMES_REF: bf0203a794a07aac3ff764972ab9087baa4e4f4e   # NousResearch/hermes-agent v0.22.5
+  OPENCLAW_VERSION: 2026.10.8
+
+jobs:
+  live:
+    # A pull request runs only when labelled `live-test`, and only from a branch of this
+    # repository: a fork's head never reaches the step that holds the key.
+    if: >-
+      github.event_name != 'pull_request_target' ||
+      (github.event.label.name == 'live-test' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    # The key belongs in this environment, with a required reviewer, so every run is approved
+    # first; approve a pull request's run only after reading its diff, since the plugin code
+    # under test runs inside the agent, whose environment carries the key. Until the
+    # environment exists GitHub creates it empty and the job runs unprotected.
+    environment: live
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        platform: [hermes, openclaw]
+    steps:
+      # The driver and every step's scripts: on a pull request, always the base branch.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.base_ref || github.sha }}
+          persist-credentials: false
+
+      # The code under test (plugin/ and tokeneconomizer/): the pull request's head, or the push.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.sha }}
+          path: under-test
+          persist-credentials: false
+
+      - name: State under the runner's temp directory
+        run: |
+          {
+            echo "CODE=$GITHUB_WORKSPACE/under-test"
+            echo "TOKENECONOMIZER_HOME=$RUNNER_TEMP/te-home"
+            echo "HERMES_HOME=$RUNNER_TEMP/hermes-home"
+            echo "LIVE_WORK=$RUNNER_TEMP/live-work"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Budget guard
+        id: guard
+        timeout-minutes: 2
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: >-
+          python scripts/live/ports.py guard --platform "${{ matrix.platform }}"
+          --model "$LIVE_MODEL" --budget "$LIVE_BUDGET_USD" --code "$CODE"
+
+      # ---- Hermes: docs/ports/HERMES.md, plugin/README.md "Hermes Agent" ----
+      - name: Install Hermes
+        if: steps.guard.outputs.run == 'true' && matrix.platform == 'hermes'
+        timeout-minutes: 15
+        run: |
+          python -m venv "$RUNNER_TEMP/hermes-venv"
+          "$RUNNER_TEMP/hermes-venv/bin/pip" install --quiet \
+            "hermes-agent @ git+https://github.com/NousResearch/hermes-agent@$HERMES_REF"
+          mkdir -p "$RUNNER_TEMP/bin" "$HERMES_HOME/plugins"
+          ln -s "$RUNNER_TEMP/hermes-venv/bin/hermes" "$RUNNER_TEMP/bin/hermes"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Configure Hermes and install the plugin
+        if: steps.guard.outputs.run == 'true' && matrix.platform == 'hermes'
+        timeout-minutes: 3
+        run: |
+          # The key stays in the environment; nothing writes it to $HERMES_HOME.
+          cat > "$HERMES_HOME/config.yaml" <<EOF
+          model:
+            provider: openrouter
+            default: $LIVE_MODEL
+          agent:
+            max_turns: 12
+          EOF
+          ln -s "$CODE/plugin/hermes" "$HERMES_HOME/plugins/tokeneconomizer"
+          hermes plugins enable tokeneconomizer
+          hermes plugins list || true
+
+      # ---- OpenClaw: docs/ports/OPENCLAW.md, plugin/README.md "OpenClaw" ----
+      - uses: actions/setup-node@v4
+        if: steps.guard.outputs.run == 'true' && matrix.platform == 'openclaw'
+        with:
+          node-version: "24"
+
+      - name: Install OpenClaw and the plugin
+        if: steps.guard.outputs.run == 'true' && matrix.platform == 'openclaw'
+        timeout-minutes: 15
+        run: |
+          npm install -g --no-fund --no-audit "openclaw@$OPENCLAW_VERSION"
+          openclaw --version
+          openclaw models set "openrouter/$LIVE_MODEL"
+          # A cap on each request's output; OpenClaw has no turn or total-token cap.
+          openclaw config set agents.defaults.params '{"maxTokens": 4096}'
+          openclaw plugins install --link "$CODE/plugin/openclaw" --accept-capabilities
+          openclaw plugins enable tokeneconomizer
+          openclaw config set plugins.entries.tokeneconomizer.hooks.allowConversationAccess true
+          "$CODE/plugin/scripts/te" --host openclaw doctor || true
+
+      - name: Five trap sessions and the assertions
+        if: steps.guard.outputs.run == 'true'
+        timeout-minutes: 35
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: >-
+          python scripts/live/ports.py run --platform "${{ matrix.platform }}"
+          --model "$LIVE_MODEL" --budget "$LIVE_BUDGET_USD" --work "$LIVE_WORK" --code "$CODE"
+          --reserve "${{ steps.guard.outputs.reserve }}"
+
+      # Only what is listed here is uploaded: the plugin's state, the driver's logs of each
+      # session, and the agents' session stores. No agent config, credentials or home directory.
+      - name: Stage the artifact
+        if: always() && steps.guard.outputs.run == 'true'
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          up="$RUNNER_TEMP/upload"
+          mkdir -p "$up"
+          [ -d "$TOKENECONOMIZER_HOME" ] && cp -a "$TOKENECONOMIZER_HOME" "$up/te-home"
+          [ -d "$LIVE_WORK/transcripts" ] && cp -a "$LIVE_WORK/transcripts" "$up/driver-logs"
+          for f in "$HERMES_HOME"/state.db "$HERMES_HOME"/state.db-wal "$HERMES_HOME"/state.db-shm; do
+            [ -f "$f" ] && mkdir -p "$up/hermes" && cp -a "$f" "$up/hermes/"
+          done
+          if [ -d "$LIVE_WORK/openclaw-state" ]; then    # its session transcripts only
+            mkdir -p "$up/openclaw-sessions"
+            (cd "$LIVE_WORK/openclaw-state" &&
+              find . -type f -name '*.jsonl' -exec cp --parents {} "$up/openclaw-sessions/" \;)
+          fi
+          # A second layer: drop any staged file that holds the key's value.
+          [ -n "$OPENROUTER_API_KEY" ] || exit 0
+          hits=$(printf '%s\n' "$OPENROUTER_API_KEY" | grep -rlF -f - "$up" || true)
+          if [ -n "$hits" ]; then
+            printf '%s\n' "$hits" | xargs -d '\n' rm -f
+            echo "::warning::removed $(printf '%s\n' "$hits" | wc -l) staged file(s) holding the key"
+          fi
+
+      - name: Upload state and transcripts
+        if: always() && steps.guard.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: ignore
+          include-hidden-files: true
+          path: ${{ runner.temp }}/upload

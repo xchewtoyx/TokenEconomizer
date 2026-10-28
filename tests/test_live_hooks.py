@@ -323,9 +323,10 @@ def _stuck(host, n=40):
                 if k % 2 == 0 else ("terminal", {"command": "pytest -q"}, json.dumps(
                     {"output": fail, "exit_code": 1, "error": None}))
                 for k in range(n)]
-    if host == "pi":
+    if host in ("pi", "openclaw"):
+        shell = "exec" if host == "openclaw" else "bash"
         return [("edit", {"path": "/r/pkg/a.py", "oldText": "x", "newText": "y"}, {"content": "ok"})
-                if k % 2 == 0 else ("bash", {"command": "pytest -q"},
+                if k % 2 == 0 else (shell, {"command": "pytest -q"},
                                     {"content": fail, "isError": True, "exit_code": 1})
                 for k in range(n)]
     return [("Edit", {"path": "/r/pkg/a.py"}, {"result_type": "success",
@@ -336,7 +337,7 @@ def _stuck(host, n=40):
             for k in range(n)]
 
 
-@pytest.mark.parametrize("host", ["claude", "codex", "copilot", "pi", "hermes"])
+@pytest.mark.parametrize("host", ["claude", "codex", "copilot", "pi", "hermes", "openclaw"])
 @pytest.mark.parametrize("mode", ["interactive", "headless"])
 @pytest.mark.parametrize("setting", ["nudge", "stop"])
 def test_the_guard_redirects_then_tells_the_person_how_to_stop_on_every_agent(
@@ -359,8 +360,9 @@ def test_the_guard_redirects_then_tells_the_person_how_to_stop_on_every_agent(
     assert stuck[0].endswith(hint)
     assert not any("continue" in o or "stopReason" in o for o in outs)  # never a stop
     if hosts.HOSTS[host].relays_notices:
-        # Claude Code keeps hook messages out of the main view (and Hermes may), so the notice
-        # also goes to the model, word for word, to pass on in its reply; the redirect first.
+        # Claude Code keeps hook messages out of the main view, an OpenClaw plugin has no way to
+        # show one (and Hermes may not), so the notice also goes to the model, word for word, to
+        # pass on in its reply; the redirect comes first.
         redirect, relay = to_model
         assert "Process check (automated)" in redirect
         assert stuck[0] in relay and "it does not change your task" in relay
@@ -960,6 +962,53 @@ def test_hermes_learns_from_its_state_db_and_injects_at_the_next_start(env, repo
     assert "/te microskills" in starts[4]["systemMessage"]      # Hermes' own command name
     rec = store_for(env, repo, "hermes").read_lines("ledger.jsonl")[0]
     assert rec["requests"] == 3 and rec["priced_by"] == "model"
+
+
+# ---- OpenClaw, through the payloads and the session log its plugin writes ----------------------
+def openclaw_trap_session(path, repo, i):
+    """The Claude trap session as the OpenClaw plugin logs it: Pi's format, one linear
+    `parentId` chain, version 4, and tool names already renamed (`exec` -> `bash`, `edit`)."""
+    pi_trap_session(path, repo, i)
+    lines = [json.loads(ln) for ln in open(path)]
+    lines[0]["version"] = 4
+    assert [e.get("parentId") for e in lines[1:]] == [None] + [e["id"] for e in lines[1:-1]]
+    with open(path, "w") as fh:
+        fh.write("\n".join(json.dumps(x) for x in lines) + "\n")
+    return path
+
+
+def test_openclaw_learns_from_its_plugins_session_log_and_injects_at_the_next_start(
+        env, repo, tmp_path):
+    starts = [run_session(env, repo, f"oc{i}",
+                          openclaw_trap_session(str(tmp_path / f"o{i}.jsonl"), repo, i),
+                          host="openclaw") for i in range(5)]
+    assert all(s == {} for s in starts[:4])
+    ctx = starts[4]["hookSpecificOutput"]["additionalContext"]
+    # a shell observation from the trap's shell calls reached the fold
+    assert "`python -m pytest …` works." in ctx
+    assert "/te microskills" in starts[4]["systemMessage"]    # the plugin's own command
+    rec = store_for(env, repo, "openclaw").read_lines("ledger.jsonl")[0]
+    assert rec["requests"] == 3 and rec["priced_by"] == "model"
+
+
+def test_a_resumed_or_reloaded_openclaw_session_gets_back_the_text_it_started_with(env, repo):
+    """OpenClaw keeps no copy of `appendSystemContext`, and a plugin reload wipes the plugin's
+    memory: the first prompt the plugin meets in a session it already logged sends SessionStart
+    with `source: "resume"`, and gets the session's first text back, not the facts as they
+    are now."""
+    st = store_for(env, repo, host="openclaw")
+    st.write("injection.json", {"rendered": "Facts:\n- one\n- two", "rendered_ids": ["a", "b"]})
+
+    def start(sid, source):
+        out = call(env, {"hook_event_name": "SessionStart", "session_id": sid, "source": source,
+                         "transcript_path": "", "cwd": repo}, "openclaw")
+        return (out.get("hookSpecificOutput") or {}).get("additionalContext") or ""
+    first = start("o1", "startup")
+    assert "- two" in first
+    st.write("injection.json", {"rendered": "Facts:\n- one", "rendered_ids": ["a"]})
+    assert start("o1", "resume") == first                       # a resume
+    assert start("o1", "resume") == first                       # and a reload after it
+    assert start("o2", "startup") == "Facts:\n- one"
 
 
 # ---- GitHub Copilot CLI, through the payloads it sends -------------------------------------

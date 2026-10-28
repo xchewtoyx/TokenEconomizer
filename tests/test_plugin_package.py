@@ -303,12 +303,334 @@ def test_the_plugin_directory_is_also_a_pi_package():
     (root_ext,) = root["pi"]["extensions"]
     assert os.path.realpath(os.path.join(os.path.dirname(PLUGIN), root_ext)) == \
         os.path.realpath(os.path.join(PLUGIN, ext))
-    assert {k: v for k, v in root.items() if k != "pi"} == {k: v for k, v in pkg.items()
-                                                           if k != "pi"}
+    # (The root is also the OpenClaw plugin `openclaw plugins install git:` installs; see below.)
+    assert {k: v for k, v in root.items() if k not in ("pi", "openclaw")} == \
+        {k: v for k, v in pkg.items() if k != "pi"}
     # no lockfile: Claude Code installs a plugin's npm dependencies only when one exists,
     # and this package has none to install (the Pi API is a peer dependency)
     assert not any(os.path.exists(os.path.join(PLUGIN, f)) for f in
                    ("package-lock.json", "npm-shrinkwrap.json", "bun.lock", "bun.lockb"))
+
+
+def test_the_openclaw_plugin_manifests_agree_and_it_never_blocks_a_call():
+    """The OpenClaw plugin is `plugin/openclaw/` for a linked install and the repository root for
+    `openclaw plugins install git:...`, which installs the clone's root: the two manifests are the
+    same, and both packages name the same entry file."""
+    here = os.path.join(PLUGIN, "openclaw")
+    manifest = _json(here, "openclaw.plugin.json")
+    assert manifest == _json(REPO, "openclaw.plugin.json")
+    assert manifest["id"] == "tokeneconomizer" and manifest["activation"] == {"onStartup": True}
+    assert manifest["contracts"] == {"agentToolResultMiddleware": ["openclaw"]}
+    pkg, root = _json(here, "package.json"), _json(REPO, "package.json")
+    assert pkg["type"] == "module"
+    (ext,) = pkg["openclaw"]["extensions"]
+    (root_ext,) = root["openclaw"]["extensions"]
+    assert os.path.realpath(os.path.join(here, ext)) == os.path.realpath(os.path.join(REPO, root_ext))
+    assert pkg["openclaw"]["compat"] == root["openclaw"]["compat"]
+    from tokeneconomizer.plugin import cli
+    assert pkg["openclaw"]["compat"]["pluginApi"] == ">=" + cli.OPENCLAW_PLUGIN_API
+    src = open(os.path.join(here, ext), encoding="utf-8").read()
+    assert 'runLauncher(join(scripts, "te-hook"), ["--host", HOST]' in src and 'HOST = "openclaw"' in src
+    # Not `before_tool_call`, which fails CLOSED when a handler throws or times out.
+    assert set(re.findall(r'api\.on\(\s*"(\w+)"', src)) == {
+        "session_start", "before_prompt_build", "agent_end", "session_end"}
+    assert "before_tool_call" not in src.replace("`before_tool_call`", "")
+    assert "carriedSection" not in src                    # Pi's sections are not OpenClaw's
+
+
+def test_both_extensions_spawn_through_the_one_shared_helper():
+    """Pi imports `plugin/shared/te-spawn.ts`; OpenClaw carries a byte-identical copy, so a
+    linked `plugin/openclaw/` imports nothing from outside its own directory."""
+    shared = open(os.path.join(PLUGIN, "shared", "te-spawn.ts"), encoding="utf-8").read()
+    assert open(os.path.join(PLUGIN, "openclaw", "te-spawn.ts"), encoding="utf-8").read() == shared
+    pi = open(os.path.join(PLUGIN, "pi", "tokeneconomizer.ts"), encoding="utf-8").read()
+    oc = open(os.path.join(PLUGIN, "openclaw", "index.ts"), encoding="utf-8").read()
+    assert 'from "../shared/te-spawn.ts"' in pi and 'from "./te-spawn.ts"' in oc
+    assert "spawn(" not in pi and "spawn(" not in oc
+
+
+OPENCLAW_DRIVER = r"""
+import { mkdirSync, writeFileSync, readFileSync, existsSync, utimesSync } from "node:fs";
+import { join } from "node:path";
+const [ext, home, repo, root, scenario] = process.argv.slice(1);
+process.env.TOKENECONOMIZER_HOME = home;
+const load = async (v) => (await import(ext + "?v=" + v));
+const mod = await load(1);
+const read = (seg) => readFileSync(mod.logPath(seg), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+const reg = (m) => {
+  const api = { rootDir: root, on: (n, h, o) => (api.hooks[n] = h), hooks: {}, logger: { info: () => {} },
+                registerAgentToolResultMiddleware: (h, o) => { api.mw = h; api.mwOpts = o; },
+                registerCommand: (c) => (api.cmd = c) };
+  m.default.register(api);
+  return api;
+};
+const ctxOf = (sid, runId, extra = {}) => ({ sessionId: sid, sessionKey: "agent:main:main", workspaceDir: repo,
+  channel: "webchat", runId, trigger: "user", activeProjectKeys: [], ...extra });
+const usage = { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: { total: 0 } };
+const asst = (ts, id) => ({ role: "assistant", timestamp: ts, model: "m", usage,
+  content: [{ type: "toolCall", id, name: "exec", arguments: { command: "pytest -q" } }] });
+const out = {};
+const api = reg(mod);
+
+if (scenario === "main") {
+  out.hooks = Object.keys(api.hooks).sort();
+  out.mwOpts = api.mwOpts;
+  out.cmdName = api.cmd.name;
+  const u = { role: "user", content: "fix it", timestamp: 1 };
+  const a = asst(2, "c1");
+  const r = { role: "toolResult", toolCallId: "c1", toolName: "exec", isError: true, timestamp: 3,
+              content: [{ type: "text", text: "boom" }] };
+  const u2 = { role: "user", content: "again", timestamp: 4 };
+  const ctx = ctxOf("S1", "r1");
+  out.first = await api.hooks.before_prompt_build({ prompt: "fix it", messages: [] }, ctx);
+  out.again = await api.hooks.before_prompt_build({ prompt: "fix it", messages: [] }, ctx);
+  out.mw = await api.mw({ toolCallId: "c1", toolName: "exec", args: { command: "pytest -q" }, isError: true,
+                         result: { content: [{ type: "text", text: "boom" }], details: { exitCode: 1, cwd: repo } } },
+                       { runtime: "openclaw", sessionId: "S1" });
+  await api.hooks.agent_end({ messages: [u, a] }, ctx);
+  await api.hooks.agent_end({ messages: [u, a, r] }, ctx);
+  const fresh = reg(await load(2));                          // a plugin reload: nothing in memory
+  await fresh.hooks.agent_end({ messages: [u, a, r] }, ctx);  // no session known: nothing written
+  out.reloaded = await fresh.hooks.before_prompt_build({ prompt: "again", messages: [u, a, r] }, ctxOf("S1", "r2"));
+  await fresh.hooks.agent_end({ messages: [r, u2] }, ctxOf("S1", "r2"));
+  const log = read(mod.segment("S1", 1));
+  out.header = log[0];
+  out.segments = mod.lastSegment("S1");
+  out.chain = log.slice(1).map((e) => [e.id, e.parentId]);
+  out.roles = log.slice(1).map((e) => e.message.role);
+  out.names = [log[2].message.content[0].name, log[3].message.toolName];
+  out.cmd = await fresh.cmd.handler({ sessionId: "S1", args: "status" });
+  out.nocmd = await fresh.cmd.handler({ sessionId: "nope" });
+  // Five prompts in one segment: the same text every time.
+  out.five = [];
+  for (let k = 1; k <= 5; k++) out.five.push(await fresh.hooks.before_prompt_build({ prompt: "p" + k, messages: [] }, ctxOf("S7", "q" + k)));
+  // Two builds at once for a new session: one SessionStart, the same facts for both.
+  out.both = await Promise.all([fresh.hooks.before_prompt_build({ prompt: "x", messages: [] }, ctxOf("S6", "w1")),
+                                fresh.hooks.before_prompt_build({ prompt: "x", messages: [] }, ctxOf("S6", "w1"))]);
+  out.s6segments = mod.lastSegment("S6");
+  // Left alone: cron, incognito, no repository, the Codex runtime (no `activeProjectKeys`).
+  out.cron = await fresh.hooks.before_prompt_build({ prompt: "x", messages: [] }, ctxOf("S2", "x", { trigger: "cron" }));
+  out.incognito = await fresh.hooks.before_prompt_build({ prompt: "x", messages: [] },
+    ctxOf("S3", "x", { sessionKey: "agent:main:dashboard:incognito-1" }));
+  out.noRepo = await fresh.hooks.before_prompt_build({ prompt: "x", messages: [] }, ctxOf("S4", "x", { workspaceDir: home }));
+  const { activeProjectKeys, ...codexCtx } = ctxOf("S5", "x");
+  out.codex = await fresh.hooks.before_prompt_build({ prompt: "x", messages: [] }, codexCtx);
+  await fresh.hooks.agent_end({ messages: [u, a] }, codexCtx);
+  out.codexCmd = await fresh.cmd.handler({ sessionId: "S5" });
+  out.noLog = ["S2", "S3", "S4", "S5"].some((s) => mod.lastSegment(s) > 0);
+} else if (scenario === "segments") {
+  // One session, a turn, a quiet stretch past the fold threshold, another turn.
+  const u = { role: "user", content: "one", timestamp: 1 };
+  const u2 = { role: "user", content: "two", timestamp: 10 };
+  await api.hooks.before_prompt_build({ prompt: "one", messages: [] }, ctxOf("L", "r1"));
+  await api.hooks.agent_end({ messages: [u, asst(2, "c1")] }, ctxOf("L", "r1"));
+  const old = (Date.now() - 700_000) / 1000;
+  utimesSync(mod.logPath(mod.segment("L", 1)), old, old);
+  await api.hooks.before_prompt_build({ prompt: "two", messages: [u, asst(2, "c1")] }, ctxOf("L", "r2"));
+  await api.hooks.agent_end({ messages: [u, asst(2, "c1"), u2, asst(11, "c2")] }, ctxOf("L", "r2"));
+  out.segments = mod.lastSegment("L");
+  out.second = read(mod.segment("L", 2)).slice(1).map((e) => e.message.role);
+} else if (scenario === "ended") {
+  // A turn, 9.5 quiet minutes (past the segment limit, short of the fold's), a turn, the end.
+  const u = { role: "user", content: "one", timestamp: 1 };
+  const u2 = { role: "user", content: "two", timestamp: 10 };
+  await api.hooks.before_prompt_build({ prompt: "one", messages: [] }, ctxOf("M", "r1"));
+  await api.hooks.agent_end({ messages: [u, asst(2, "c1")] }, ctxOf("M", "r1"));
+  const old = (Date.now() - 570_000) / 1000;
+  utimesSync(mod.logPath(mod.segment("M", 1)), old, old);
+  await api.hooks.before_prompt_build({ prompt: "two", messages: [u, asst(2, "c1")] }, ctxOf("M", "r2"));
+  await api.hooks.agent_end({ messages: [u, asst(2, "c1"), u2, asst(11, "c2")] }, ctxOf("M", "r2"));
+  await api.hooks.session_end({ sessionId: "M", reason: "idle" }, { sessionId: "M" });
+  out.segments = mod.lastSegment("M");
+} else if (scenario === "late") {
+  // The next prompt arrives before the old run's agent_end: the old segment is ended (and, with
+  // TE_FOLD_SYNC, folded) only after that agent_end has logged the run.
+  const u = { role: "user", content: "one", timestamp: 1 };
+  const u2 = { role: "user", content: "two", timestamp: 10 };
+  await api.hooks.before_prompt_build({ prompt: "one", messages: [] }, ctxOf("N", "r1"));
+  const old = (Date.now() - 570_000) / 1000;
+  utimesSync(mod.logPath(mod.segment("N", 1)), old, old);
+  const second = api.hooks.before_prompt_build({ prompt: "two", messages: [] }, ctxOf("N", "r2"));
+  await new Promise((done) => setTimeout(done, 300));
+  await api.hooks.agent_end({ messages: [u, asst(2, "c1")] }, ctxOf("N", "r1"));
+  await second;
+  await api.hooks.agent_end({ messages: [u, asst(2, "c1"), u2, asst(11, "c2")] }, ctxOf("N", "r2"));
+  await api.hooks.session_end({ sessionId: "N", reason: "idle" }, { sessionId: "N" });
+  out.first = read(mod.segment("N", 1)).slice(1).map((e) => e.message.role);
+  out.second = read(mod.segment("N", 2)).slice(1).map((e) => e.message.role);
+} else if (scenario === "sameMs") {
+  // Two replies in one millisecond, logged by a whole-session batch, then again by a per-run one.
+  const u = { role: "user", content: "go", timestamp: 5 };
+  const batch = [u, asst(5, "c1"), asst(5, "c2")];
+  await api.hooks.before_prompt_build({ prompt: "go", messages: [] }, ctxOf("Q", "r1"));
+  await api.hooks.agent_end({ messages: batch }, ctxOf("Q", "r1"));
+  await api.hooks.agent_end({ messages: batch.slice(1) }, ctxOf("Q", "r1"));
+  out.path = mod.logPath(mod.segment("Q", 1));
+} else if (scenario === "repo") {
+  // A workspace below a versioned home is not a checkout, nor is one with an empty `.git`.
+  const h = join(home, "user");
+  mkdirSync(join(h, ".git"), { recursive: true });
+  writeFileSync(join(h, ".git", "HEAD"), "ref: refs/heads/main\n");
+  mkdirSync(join(h, "ws"), { recursive: true });
+  mkdirSync(join(home, "empty", ".git"), { recursive: true });
+  const saved = process.env.HOME;
+  process.env.HOME = h;
+  out.home = await api.hooks.before_prompt_build({ prompt: "x", messages: [] }, ctxOf("H", "x", { workspaceDir: join(h, "ws") }));
+  process.env.HOME = saved;
+  out.empty = await api.hooks.before_prompt_build({ prompt: "x", messages: [] }, ctxOf("E", "x", { workspaceDir: join(home, "empty") }));
+  out.real = mod.inRepo(repo);
+  out.noLog = mod.lastSegment("H") + mod.lastSegment("E");
+}
+console.log(JSON.stringify(out));
+"""
+
+
+def _openclaw_node(tmp_path, scenario, **env):
+    """Run OPENCLAW_DRIVER's `scenario` against the real dispatcher; (output, repo, home)."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    home = tmp_path / "home"
+    ext = os.path.join(PLUGIN, "openclaw", "index.ts")
+    run = subprocess.run([node, "--experimental-strip-types", "--no-warnings", "--input-type=module",
+                          "-e", OPENCLAW_DRIVER, ext, str(home), str(repo),
+                          os.path.join(PLUGIN, "openclaw"), scenario],
+                         capture_output=True, text=True, timeout=180,
+                         env=dict(os.environ, TE_SIDECALL="", TE_DISABLE="", TE_MICROSKILLS="envfacts",
+                                  GIT_CEILING_DIRECTORIES=str(tmp_path), **env))
+    if run.returncode and "strip-types" in run.stderr:
+        pytest.skip("this node cannot load TypeScript")
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout), repo, home
+
+
+def _openclaw_store(repo, home):
+    from tokeneconomizer.plugin.paths import repo_identity, repo_state_dir
+    from tokeneconomizer.plugin.store import Store
+    env = dict(os.environ, TOKENECONOMIZER_HOME=str(home))
+    return Store(repo_state_dir(repo_identity(str(repo), env), "openclaw", env))
+
+
+def test_the_openclaw_plugin_logs_each_message_once_across_reloads_and_starts_from_the_log(tmp_path):
+    """The plugin, loaded by Node with a stand-in for OpenClaw's `api`, against the real
+    dispatcher: a session in a git checkout starts on its first prompt and gets the same text on
+    every prompt; a repeated build of one run opens no second turn, and two builds at once start
+    the session once; `agent_end` batches that overlap, and a reload, append each message once to
+    one linear `parentId` chain with the tool names renamed; after the reload the segment is
+    started again from its log, as a resume; cron, incognito, repository-less and Codex-runtime
+    sessions leave nothing behind."""
+    st = _openclaw_store(tmp_path / "repo", tmp_path / "home")
+    st.write("injection.json", {"rendered": "Facts:\n- one", "rendered_ids": ["a"]})
+    out, repo, home = _openclaw_node(tmp_path, "main")
+    assert out["hooks"] == ["agent_end", "before_prompt_build", "session_end", "session_start"]
+    assert out["mwOpts"] == {"runtimes": ["openclaw"]} and out["cmdName"] == "te"
+    facts = {"appendSystemContext": "Facts:\n- one"}
+    # the same text on every prompt, and again after the reload, from the stored start
+    assert out["first"] == out["again"] == out["reloaded"] == facts
+    assert out["five"] == [facts] * 5 and out["both"] == [facts, facts]
+    assert out.get("mw") is None                                    # no redirect for one call
+    assert out["header"]["type"] == "session" and out["header"]["cwd"] == str(repo)
+    assert out["segments"] == 1 and out["s6segments"] == 1
+    ids = [i for i, _ in out["chain"]]
+    assert out["chain"] == [list(p) for p in zip(ids, [None] + ids[:-1])]   # linear, no branches
+    assert out["roles"] == ["user", "assistant", "toolResult", "user"]     # each message once
+    assert out["names"] == ["bash", "bash"]
+    assert str(repo) in out["cmd"]["text"] and "no repository" in out["nocmd"]["text"]
+    assert out.get("cron") is out.get("incognito") is out.get("noRepo") is out.get("codex") is None
+    assert "no repository" in out["codexCmd"]["text"] and not out["noLog"]
+    # What the dispatcher recorded: one segment, started, then started again from its log.
+    sess = st.read(os.path.join("sessions", "S1#1.json"))
+    assert sess["source"] == "resume" and sess["cwd"] == str(repo)
+    assert [t["turn_key"] for t in sess["turns"]] == ["S1#1:r1", "S1#1:r2"]   # one turn per run
+    assert [t["turn_key"] for t in st.read(os.path.join("sessions", "S6#1.json"))["turns"]] == []
+    assert st.read(os.path.join("sessions", "S6#1.json"))["turn"]["turn_key"] == "S6#1:w1"
+
+
+def test_an_openclaw_session_that_outlives_its_fold_goes_on_in_a_new_segment(tmp_path):
+    """OpenClaw keeps one session for days; the dispatcher folds a quiet session once. A prompt
+    after the quiet stretch starts the next segment, whose start folds the first; the next
+    segment's fold counts only its own turn."""
+    from tokeneconomizer.plugin import hook
+    import io
+    out, repo, home = _openclaw_node(tmp_path, "segments", TE_FOLD_SYNC="1")
+    assert out["segments"] == 2 and out["second"] == ["user", "assistant"]
+    st = _openclaw_store(repo, home)
+    seg2 = os.path.join(str(home), "hosts", "openclaw", "sessions", "L#2.jsonl")
+    env = {"TOKENECONOMIZER_HOME": str(home), "TE_FOLD_SYNC": "1", "TE_MICROSKILLS": "envfacts",
+           "GIT_CEILING_DIRECTORIES": str(tmp_path), "PATH": os.environ.get("PATH", "")}
+    hook.main(["--host", "openclaw"], io.StringIO(json.dumps({
+        "hook_event_name": "SessionEnd", "session_id": "L#2", "transcript_path": seg2,
+        "cwd": str(repo), "reason": "other"})), io.StringIO(), env)
+    ledger = {r["session_id"]: r for r in st.read_lines("ledger.jsonl")}
+    assert set(ledger) == {"L#1", "L#2"}
+    assert ledger["L#1"]["requests"] == ledger["L#2"]["requests"] == 1
+
+
+def test_a_segment_change_ends_the_quiet_segment_so_both_are_folded(tmp_path):
+    """The next segment begins after 9 quiet minutes, before the fold would pick up the old one
+    (10): it is ended there, so it folds then, and a session that stops after the next turn
+    leaves no segment waiting for a SessionStart that may never come."""
+    out, repo, home = _openclaw_node(tmp_path, "ended", TE_FOLD_SYNC="1")
+    assert out["segments"] == 2
+    st = _openclaw_store(repo, home)
+    sess = {k: st.read(os.path.join("sessions", f"M#{k}.json")) for k in (1, 2)}
+    assert sess[1]["end_reason"] == "segment" and sess[2]["end_reason"] == "idle"
+    # The second end's fold runs detached in the plugin; here, inline, past the hook's budget,
+    # so another session's start picks it up as an ended session.
+    from tokeneconomizer.plugin import hook
+    import io
+    env = {"TOKENECONOMIZER_HOME": str(home), "TE_FOLD_SYNC": "1", "TE_MICROSKILLS": "envfacts",
+           "GIT_CEILING_DIRECTORIES": str(tmp_path), "PATH": os.environ.get("PATH", "")}
+    hook.main(["--host", "openclaw"], io.StringIO(json.dumps({
+        "hook_event_name": "SessionStart", "session_id": "other", "source": "startup",
+        "transcript_path": "", "cwd": str(repo)})), io.StringIO(), env)
+    ledger = {r["session_id"]: r for r in st.read_lines("ledger.jsonl")}
+    assert set(ledger) == {"M#1", "M#2"}
+    assert ledger["M#1"]["requests"] == ledger["M#2"]["requests"] == 1
+
+
+def test_a_segment_is_ended_only_after_its_last_run_is_logged(tmp_path):
+    """The next prompt can start a segment before the old run's `agent_end`: the old segment's
+    SessionEnd, whose fold reads its log, waits for that `agent_end` to write the run."""
+    out, repo, home = _openclaw_node(tmp_path, "late", TE_FOLD_SYNC="1")
+    assert out["first"] == ["user", "assistant"] and out["second"] == ["user", "assistant"]
+    st = _openclaw_store(repo, home)
+    ledger = {r["session_id"]: r for r in st.read_lines("ledger.jsonl")}
+    assert ledger["N#1"]["requests"] == 1                # folded after the run was logged
+    assert not (home / "errors.log").exists() or "not yet logged" not in (home / "errors.log").read_text()
+
+
+def test_two_replies_in_one_millisecond_are_both_logged_and_priced(tmp_path):
+    """The log knows a message by its content, not by (role, timestamp, toolCallId): two
+    assistant messages that share a millisecond are two entries, each with its usage, and a
+    repeated batch adds neither again."""
+    from tokeneconomizer import trace
+    out, repo, home = _openclaw_node(tmp_path, "sameMs")
+    entries = [json.loads(ln) for ln in open(out["path"])][1:]
+    assert [e["message"]["role"] for e in entries] == ["user", "assistant", "assistant"]
+    usage = trace.pi_session_usage(out["path"])
+    assert usage["requests"] == 2 and usage["output_tokens"] == 4
+
+
+def test_the_openclaw_plugin_takes_a_checkout_as_the_core_does(tmp_path):
+    """`inRepo` is `paths.find_repo_root`'s rule: a versioned home is no checkout for the
+    directories below it, and an empty `.git` directory is none at all."""
+    out, repo, home = _openclaw_node(tmp_path, "repo")
+    assert out.get("home") is out.get("empty") is None and out["noLog"] == 0 and out["real"]
+    from tokeneconomizer.plugin.paths import find_repo_root
+    assert find_repo_root(str(home / "user" / "ws"), {"HOME": str(home / "user")}) is None
+    assert find_repo_root(str(home / "empty"), {"HOME": "/nonexistent"}) is None
+
+
+def test_the_openclaw_quiet_limit_is_inside_the_folds(tmp_path):
+    """A segment takes no turn once the dispatcher may have folded it."""
+    from tokeneconomizer.plugin import fold
+    src = open(os.path.join(PLUGIN, "openclaw", "index.ts"), encoding="utf-8").read()
+    quiet_ms = int(re.search(r"QUIET_MS = ([\d_]+);", src).group(1).replace("_", ""))
+    assert quiet_ms < fold.STALE_S * 1000
 
 
 def test_the_plugin_carries_the_core_as_symlinks_an_install_copy_follows(tmp_path):

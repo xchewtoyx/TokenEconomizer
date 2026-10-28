@@ -1,12 +1,14 @@
 # TokenEconomizer plugin
 
-How to install and use TokenEconomizer in Claude Code, Codex, the GitHub Copilot CLI and Pi. What
+How to install and use TokenEconomizer in Claude Code, Codex, the GitHub Copilot CLI, Pi and
+OpenClaw. What
 the plugin does and why is in the [main README](../README.md); its design and the verified
 behaviour of each agent are in [`docs/PLUGIN.md`](../docs/PLUGIN.md).
 
 - [Before you start](#before-you-start)
 - Install and use it on [Claude Code](#claude-code) · [Codex](#codex) ·
-  [Copilot CLI](#copilot-cli) · [Pi](#pi) · [Hermes Agent](#hermes-agent-unverified)
+  [Copilot CLI](#copilot-cli) · [Pi](#pi) · [Hermes Agent](#hermes-agent-unverified) ·
+  [OpenClaw](#openclaw)
 - [What to expect](#what-to-expect) · [Commands](#commands) · [Settings](#settings)
 - [Repository map](#repository-map) · [Using with rtk](#using-with-rtk) ·
   [Model calls and API keys](#model-calls-and-api-keys) · [Troubleshooting](#troubleshooting)
@@ -329,6 +331,60 @@ terminal end up in two places. The plugin runs the `python3` on `PATH`.
 **Uninstall.** `hermes plugins disable tokeneconomizer`, then remove
 `~/.hermes/plugins/tokeneconomizer`. Optional: `rm -rf ~/.tokeneconomizer`.
 
+## OpenClaw
+
+Not yet verified against a running gateway with a model: see the OpenClaw block in
+[`docs/PLUGIN.md`](../docs/PLUGIN.md) §3 for what has been checked. Needs OpenClaw 2026.10.8 or
+later and `python3` (3.10+) on the gateway host; the official images have it.
+
+**1. Install.** Clone the repository and link its `plugin/openclaw` directory, which keeps it in
+place (it reaches the launchers in `plugin/scripts` and the core through `plugin/lib`):
+
+```bash
+git clone https://github.com/microsoft/TokenEconomizer
+openclaw plugins install --link ./TokenEconomizer/plugin/openclaw --accept-capabilities
+openclaw plugins enable tokeneconomizer
+openclaw config set plugins.entries.tokeneconomizer.hooks.allowConversationAccess true
+```
+
+`--accept-capabilities` (or `--force`) is the consent OpenClaw asks for on a linked plugin. The
+last line is required: without it the plugin can neither add the facts to a prompt nor log a
+turn. OpenClaw refuses a plugin directory that is world-writable or owned by anyone but the
+gateway's user or root ("suspicious ownership"), so keep the clone owned by that user.
+`openclaw plugins install git:github.com/microsoft/TokenEconomizer` installs the repository root,
+which carries the same manifest; that route is not verified yet.
+
+In Docker, mount a read-only checkout (for example at `/opt/tokeneconomizer`), run
+`openclaw plugins install -l /opt/tokeneconomizer/plugin/openclaw --force`, and set
+`TOKENECONOMIZER_HOME=/home/node/.openclaw/tokeneconomizer` in the gateway's environment, so the
+plugin's state lives in OpenClaw's persistent state mount rather than the container's writable
+layer.
+
+**2. Check it.** `~/.tokeneconomizer/bin/te --host openclaw doctor` reports the OpenClaw version
+and whether `allowConversationAccess` is on. In a session, `/te status`, `/te microskills`,
+`/te config …` and `/te repos` work once the session has a repository.
+
+**3. Work normally.** See [What to expect](#what-to-expect). What differs on OpenClaw:
+
+- A session belongs to a repository when its workspace is inside a git checkout, or else from the
+  directory of its first `exec` call; in the second case the facts join from its second prompt.
+  When the session's tools are sandboxed, only the workspace counts.
+- The facts go into the system prompt as `appendSystemContext`, the same text on every prompt.
+- The plugin keeps its own copy of each session's messages, in
+  `~/.tokeneconomizer/hosts/openclaw/sessions/`, because OpenClaw's store cannot be read from
+  the standard library. It holds conversation text, and it is kept after the plugin has learned
+  from it; delete that directory to remove it. A session that goes quiet for 9 minutes carries
+  on as a new segment (`<session>#2`, …) with its own log, and gets the facts as they are then.
+- A plugin cannot show you a notice on OpenClaw, so the plugin's notices go to the gateway log,
+  and a turn that is still stuck after the loop guard's redirect is reported through the model's
+  reply: send **/stop** to stop it.
+- Only OpenClaw's own runtime is supported; on the Codex runtime the loop guard does not run.
+  Code Mode runs many tool calls as one `exec`, which the loop guard sees as one command. Cron
+  and heartbeat turns and incognito sessions are left alone. Tool pruning does not apply yet.
+
+**Uninstall.** `openclaw plugins uninstall tokeneconomizer`. Optional:
+`rm -rf ~/.tokeneconomizer`.
+
 ## What to expect
 
 The plugin works session by session: what it learns from a repository's earlier sessions is
@@ -409,6 +465,7 @@ How to run them:
 | Codex | `$tokeneconomizer:<command>` (`status`, `microskills`, `toolprune`, `config`, `repos`) | `~/.tokeneconomizer/bin/te --host codex <command>` |
 | Copilot CLI | `/tokeneconomizer:<command>` (interactive mode) | `~/.tokeneconomizer/bin/te --host copilot <command>` |
 | Pi | `/te <command>` | `~/.tokeneconomizer/bin/te --host pi <command>` |
+| OpenClaw | `/te <command>` | `~/.tokeneconomizer/bin/te --host openclaw <command>` |
 
 `doctor` and `repomap` run from a terminal (or as `/te …` on Pi); there is no slash command or
 Codex skill for them.

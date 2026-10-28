@@ -31,8 +31,8 @@
 
 `te facts` and `te untool` are the earlier names of `microskills` and `toolprune`, and still work.
 `--cwd` picks the repository (default: the current directory) and `--host` the agent
-(claude | codex | copilot | pi; default: `TE_HOST`, else the agent whose shell runs `te`, else
-claude).
+(claude | codex | copilot | pi | openclaw; default: `TE_HOST`, else the agent whose shell runs
+`te`, else claude).
 """
 import argparse
 import glob
@@ -610,6 +610,34 @@ def cmd_probe(args):
     return probe.run(sessions=args.sessions, model=args.model, keep=args.keep)
 
 
+OPENCLAW_PLUGIN_API = "2026.10.8"     # plugin/openclaw/package.json `openclaw.compat.pluginApi`
+
+
+def _doctor_openclaw():
+    """The OpenClaw version against the plugin's API floor, and the grant without which the
+    plugin can neither add the facts nor log a turn."""
+    import re
+    import subprocess
+
+    def ask(*argv):
+        try:
+            return subprocess.run(["openclaw", *argv], capture_output=True, text=True, timeout=30,
+                                  stdin=subprocess.DEVNULL).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    m = re.search(r"\d{4}\.\d+\.\d+", ask("--version"))
+    have = tuple(int(x) for x in m.group(0).split(".")) if m else None
+    floor = tuple(int(x) for x in OPENCLAW_PLUGIN_API.split("."))
+    print(f"openclaw    version {m.group(0) if m else 'unknown'}"
+          + ("" if have is None or have >= floor else
+             f" (the plugin needs >= {OPENCLAW_PLUGIN_API})"))
+    grant = ask("config", "get", "plugins.entries.tokeneconomizer.hooks.allowConversationAccess")
+    print("openclaw    allowConversationAccess " + (
+        "on" if grant.lower() == "true" else
+        "OFF: `openclaw config set plugins.entries.tokeneconomizer.hooks.allowConversationAccess "
+        "true` (without it the plugin adds no facts and logs no turn)"))
+
+
 def cmd_doctor(args):
     ok = sys.version_info >= (3, 10)
     print(f"python      {sys.version.split()[0]} {'ok' if ok else '(needs >= 3.10)'}")
@@ -625,9 +653,9 @@ def cmd_doctor(args):
         ok = False
     import shutil as _sh
     # Only the agents installed here: a Codex-only machine has no Claude Code catalog to probe.
-    agents = [h for h in ("claude", "codex", "copilot", "pi", "hermes") if _sh.which(h)]
-    print(f"agents      "
-          f"{', '.join(agents) or 'none of claude, codex, copilot, pi, hermes on PATH'}")
+    names = ("claude", "codex", "copilot", "pi", "hermes", "openclaw")
+    agents = [h for h in names if _sh.which(h)]
+    print(f"agents      {', '.join(agents) or 'none of ' + ', '.join(names) + ' on PATH'}")
     for h in agents:
         pause = sidecall.paused(h, root)
         if pause:
@@ -677,6 +705,8 @@ def cmd_doctor(args):
                  else "not in " + os.path.dirname(plug))
         print(f"hermes      plugin {where} (`hermes plugins enable tokeneconomizer` turns it "
               f"on); state.db {'present' if os.path.exists(db) else 'not found'}")
+    if "openclaw" in agents:
+        _doctor_openclaw()
     ctx = _ctx(args)
     print(f"repository  {ctx.repo.root}: {repos.describe(ctx.repo)}; state {ctx.repo.key}")
     home_git = os.path.join(paths.home_dir(), ".git")

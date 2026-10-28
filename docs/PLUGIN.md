@@ -487,6 +487,43 @@ steering message (a `custom_message` of type `tokeneconomizer`), after which it 
 re-running the test and found the missing fixture. With every run piped (`npm test 2>&1 | tail
 -n 8`), each counted as failing and the judge found the turn stuck (0.90).
 
+**OpenClaw 2026.10.8 — read from source, loaded but not yet run with a model** (source at
+`openclaw/openclaw@4a0ab09`, the npm release `dc2523e`; the spec and its citations are in
+[`ports/OPENCLAW.md`](ports/OPENCLAW.md)):
+
+* `plugin/openclaw/index.ts` is a native OpenClaw plugin that speaks the dispatcher's protocol on
+  OpenClaw's behalf, as the Pi extension does on Pi. It registers `session_start`,
+  `before_prompt_build`, `agent_end` and `session_end`, one tool-result middleware for the
+  `openclaw` runtime, and `/te`; no `before_tool_call`, which fails closed.
+* **Verified (the release, no model):** `openclaw plugins install --link plugin/openclaw
+  --accept-capabilities`, `enable` and `config set …allowConversationAccess true` load it with
+  no diagnostics; `plugins inspect --runtime` lists the four hooks, the command and the
+  middleware contract, with `rootDir` the linked directory. `te --host openclaw doctor` read the
+  version and the grant. The side call's `agent exec` accepted the tool-denying config and
+  stopped only for want of a model login. The release's `agent exec` has no
+  `--config-override`, which the source has; the side call falls back to a config file that
+  includes the person's own.
+* **Verified (tests, the real dispatcher, a stand-in for OpenClaw's `api`):** a session in a git
+  checkout starts on its first prompt and gets the same `appendSystemContext` on every prompt and
+  after a plugin reload (started again from its log, as a resume); a repeated build of one run
+  opens no second turn; overlapping `agent_end` batches and a reload append each message once,
+  in one linear `parentId` chain, with `exec` logged as `bash`; cron, heartbeat, incognito and
+  repository-less sessions leave nothing behind, and so do turns on the Codex runtime (whose
+  prompt-hook context lacks the `activeProjectKeys` OpenClaw's own runtime sets: no hook context
+  names its runtime). A workspace counts as a checkout by `paths.find_repo_root`'s rule. Two
+  prompt builds at once start a session once, and five prompts get the same text. A session
+  quiet for 9 minutes goes on in a new segment (`<sessionId>#<n>`, its own log and fold; the
+  quiet one is ended there, so it folds at once), since
+  the dispatcher folds a session once, after `fold.STALE_S`; a test folds one segment, then the
+  next with only its own turn's usage. A new segment starts with the facts as they are then, so
+  `appendSystemContext` may change at that boundary, after a gap longer than a provider's prompt
+  cache lasts. Logs in that shape taught the missing-`pytest`
+  fact over four sessions, injected at the fifth session's start.
+* **Unverified:** everything a model turn shows — that the middleware's appended text is what
+  the model reads, notices, usage on real `agent_end` messages, `/te` inside a chat, the side
+  call's answer, and the `git:` install of the repository root (whose `npm install` also fetches
+  the Pi package named as a peer dependency).
+
 **How the guard reads a test run, 2026-10-26.** A command line's exit status is its last
 command's, so it may not be the test run's: `npm test 2>&1 | tail -n 8` exits with `tail`'s,
 `npm test || true` and `python -m unittest; echo "exit=$?"` with 0, and `pytest -q; git diff`
@@ -532,6 +569,10 @@ was recorded with its `state.db#<id>` path, from Hermes' own `get_hermes_home`),
 All state is local, under `$TOKENECONOMIZER_HOME` (default `~/.tokeneconomizer`), one directory
 per repository and host: the mechanisms' own state, `ledger.jsonl` (one priced record per
 session), `events.jsonl` (every injection, redirect and still-stuck notice), and per-session guard state.
+On OpenClaw it also holds the plugin's copy of each session's messages
+(`hosts/openclaw/sessions/`), conversation text included. **These logs are kept**: nothing
+deletes them after a fold (the spec's §4 asks for deletion; not decided yet). Delete
+`$TOKENECONOMIZER_HOME/hosts/openclaw/sessions/` to remove them.
 Uninstalling the plugin leaves this directory; delete it to forget. `te repos` lists what it
 holds.
 
@@ -600,6 +641,12 @@ open-vocabulary. On a repository you do not trust, leave micro-skills off (the d
   already found its cause and was working around it; since 2026-10-25 the judge decides every
   redirect but the backstop's, which still counts.
 * **Pi** — tool pruning is not planned there, since Pi declares only four tools by default.
+* **OpenClaw** — not yet run with a model (§3). Tool pruning is phase 2 (`toolsAllow`). A
+  session whose workspace is not a git checkout joins its repository from its second prompt.
+  The plugin's own session logs (`$TOKENECONOMIZER_HOME/hosts/openclaw/sessions/`, default
+  `~/.tokeneconomizer/hosts/openclaw/sessions/`) are kept after the fold, with their
+  conversation text (§4). A single tool call longer than 9 minutes can let its segment fold
+  under it, and that turn goes unlearned.
 * **Known gaps:**
   * `codex exec` prints no hook messages, so a headless Codex run shows no notice; `te status`
     counts it afterwards. On Claude Code the notice reaches the conversation and `claude -p`'s
@@ -616,3 +663,68 @@ open-vocabulary. On a repository you do not trust, leave micro-skills off (the d
 * Windows (the launcher is POSIX `sh`), Python 3.9, and compressed Codex rollouts (`.zst`).
 * Transcript formats are internal to each agent and change between versions; the readers are
   pinned by tests against the shapes observed on the versions above.
+
+## 6. Live tests of the Hermes and OpenClaw ports
+
+`.github/workflows/live-ports.yml` runs §3's trap through each port's own CLI on OpenRouter:
+five sessions in `te probe`'s throwaway repository, where bare `pytest` is missing and
+`python -m unittest` works (`scripts/live/ports.py`; it lives beside `scripts/build_plugin.py`,
+not under `experiments/`, because it tests the plugin, not a benchmark arm). Hermes runs
+`v0.22.5` (`hermes chat -q … --max-turns 12`; the earlier `v2026.9.24` tag lacks the
+`PluginContext` methods the shim calls), OpenClaw `2026.10.8` (`openclaw agent exec`, which has
+no turn limit: its timeout and a 4096-token cap on each request's output bound it). Each is set up as `plugin/README.md` describes, with
+`microskills=envfacts` (no model call to learn) and `TOKENECONOMIZER_HOME` under
+`$RUNNER_TEMP`. The job then checks, from the plugin's own state:
+
+* every session the plugin recorded has a ledger row with its model, token counts and effective
+  tokens (`priced_by` is `fallback` for a model `pricing.py` does not list, which is how every
+  non-Claude OpenRouter model is priced; the ledger counts tokens, not dollars);
+* a later session's start logged an `inject` event: the fact was learned, then injected;
+* `errors.log` is empty;
+* every session was folded at its own end (one that was not is folded by `te fold` so the rest
+  can run, and fails the job); on OpenClaw, its log exists.
+
+What is under test is the plugin, not the model. A run where the model ran no command, or met
+the trap too seldom to teach the fact, is reported **inconclusive** (a warning, not a failure);
+an OpenRouter rate limit is reported as **skipped**.
+
+**Running it.** Push to `claw-port` touching a port, `plugin/shared`, `plugin/scripts`,
+`tokeneconomizer/`, the driver or the workflow; or add the label `live-test` to a pull request
+into `claw-port` from a branch of this repository (re-add it to run again). A fork's pull
+request never runs it. A labelled pull request runs as `pull_request_target`: the workflow, the
+budget guard and the driver come from `claw-port` as it stands, and only the plugin and core
+under test (`plugin/`, `tokeneconomizer/`) from the pull request's head, checked out apart. A port not yet in the tree is skipped. `workflow_dispatch` works only
+once the workflow is on the default branch, which it is not meant to be. Only an allowlist is
+uploaded, as an artifact kept 7 days: `$TOKENECONOMIZER_HOME`, the driver's log of each session,
+Hermes' `state.db` and OpenClaw's session transcripts (`*.jsonl`); never agent config,
+credentials or a home directory. Any staged file that still holds the key is dropped. Nothing
+is committed.
+
+**Before the first run**, create a GitHub Environment named `live` (Settings → Environments)
+with yourself as a required reviewer, and move `OPENROUTER_API_KEY` into it as an environment
+secret. The job names that environment, so every run then waits for approval before it can read
+the key. Until the environment exists, GitHub creates it on the first run with no protection
+rules and no secrets, and the job runs unapproved with the repository secret.
+
+**Approve a `live` run only after reading the pull request's diff.** The plugin code under test
+runs inside the agent, whose environment carries the key, so approving a labelled pull request
+vouches for everything its diff changes under `plugin/` and `tokeneconomizer/`.
+
+**The model** is `z-ai/glm-5.3-flash`, overridable with the repository variable `LIVE_MODEL` (an
+OpenRouter model id). At run start the job checks that OpenRouter still lists it with `tools` in
+its supported parameters, and fails if not, rather than substituting another model. OpenRouter
+routes it to one of many third-party providers, whose retention and training policies differ;
+the repository it sees is synthetic.
+
+**The budget guard is best effort.** The only hard cap is a weekly credit limit set on the key
+itself in OpenRouter's settings; set one. The guard is the first step of each platform's job:
+`GET /api/v1/key` gives the key's `usage_weekly` (the current UTC week, from Monday), and the job
+is skipped with a notice when that plus the run's reserve exceeds $2.00. The reserve is an
+estimate, not a bound: five sessions at 300k input and 15k output tokens each, plus a quarter
+for the plugin's own side calls, at the dearest provider's price that
+`GET /api/v1/models/<id>/endpoints` lists for the model. Without those prices the job is skipped.
+While each session runs, a watchdog reads the key's spend every 15 s and kills the agent once
+the run has spent half its reserve; the other half covers what was spent but not yet reported,
+since OpenRouter's usage figure lags the requests. The weekly spend is also checked before every
+session. Runs never overlap (one `concurrency` group), so each guard sees the previous run's
+spend. The guard reads this one key's usage only.

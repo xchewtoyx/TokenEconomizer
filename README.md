@@ -63,8 +63,9 @@ mechanisms:
   turn is still stuck after that, TokenEconomizer tells you how to stop it; it never stops a turn
   itself.
 
-TokenEconomizer is a plugin for **Claude Code**, **Codex**, the **GitHub Copilot CLI** and **Pi**.
-A port to **Hermes Agent** is in progress and not yet checked on a running Hermes
+TokenEconomizer is a plugin for **Claude Code**, **Codex**, the **GitHub Copilot CLI** and **Pi**;
+support for **OpenClaw** is new and not yet run with a model, and a port to **Hermes Agent** is in
+progress and not yet checked on a running Hermes
 ([plugin/README.md](plugin/README.md#hermes-agent-unverified)).
 Each italic letter above is a setting, shown with its default ([Settings](#settings)), and each
 mechanism can be turned on or off. The plugin announces each action in one line, and if any part
@@ -163,6 +164,9 @@ pi install git:github.com/microsoft/TokenEconomizer
 
 Start `pi` and run `/te status`.
 
+**OpenClaw** links a clone's `plugin/openclaw` directory; see
+[`plugin/README.md`](plugin/README.md#openclaw).
+
 If the install worked, the status command prints a short status block. `refresh-catalog`
 records every tool a session loads (without a model call), so that tool pruning can consider all
 of them. Keep the marketplace path absolute, as above: the Copilot CLI reads a relative path such
@@ -187,6 +191,7 @@ uninstalling, using Copilot with your own model key, and troubleshooting.
 | Codex | 0.153.1 to 0.164.0 | not supported |
 | Copilot CLI | 1.0.83 to 1.0.102 | not supported |
 | Pi | 1.2.0 to 1.3.0 | 0.99.x: load the extension by path (below) |
+| OpenClaw | 2026.10.8 (loaded, not yet run with a model) | not supported |
 
 The commands above were tested on the oldest and newest version in each range; newer versions
 have not been tested yet.
@@ -205,7 +210,7 @@ commands. They have the same names on every agent; only the way you type them di
 |---|---|
 | Claude Code, Copilot CLI | `/tokeneconomizer:<command>` |
 | Codex | `$tokeneconomizer:<command>` |
-| Pi | `/te <command>` |
+| Pi, OpenClaw | `/te <command>` |
 | a terminal, in the repository | `~/.tokeneconomizer/bin/te <command>` |
 
 | Command | What it does |
@@ -334,7 +339,7 @@ agent's own limits; afterwards, `te status` counts the redirects and "still stuc
 | [`tokeneconomizer/loopguard`](tokeneconomizer/loopguard/) | Failure-loop intervention: the per-call guard and its per-repository envelope |
 | [`tokeneconomizer/trace`](tokeneconomizer/trace/) | Each agent's session log, read into one shape |
 | [`tokeneconomizer/plugin`](tokeneconomizer/plugin/) | The runtime the hooks and the `te` command run |
-| [`plugin`](plugin/) | The installable plugin: manifests, hook files, launchers, slash commands, the Pi extension |
+| [`plugin`](plugin/) | The installable plugin: manifests, hook files, launchers, slash commands, the Pi extension, the OpenClaw plugin |
 | [`experiments`](experiments/) | The harness, launchers and task sets behind the paper's results |
 | [`docs`](docs/) | `PLUGIN.md` (design, verified agent behavior) and `ARCHITECTURE.md` (how the package fits together) |
 | [`tests`](tests/) | Offline tests for the package and the plugin |
