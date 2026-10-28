@@ -560,6 +560,78 @@ def test_the_hermes_shim_drives_the_dispatcher_end_to_end(tmp_path, monkeypatch)
     assert "TokenEconomizer" in ctx.commands["te"]("status", session_id="s1")
 
 
+def test_a_hermes_turn_of_many_calls_is_one_guarded_turn(tmp_path, monkeypatch):
+    """Through the shim and the real launcher: a turn's calls fold into one guard, so a stuck
+    turn reaches the redirect (appended to the result the model reads), a repeated
+    `pre_llm_call` for the same turn does not reopen it, and `on_session_end` closes it."""
+    from tests.test_live_hooks import _stuck
+    for k, v in _hook_env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    work = tmp_path / "work"
+    work.mkdir()
+    ctx = _HermesCtx(str(work))
+    _load_hermes_shim().register(ctx)
+    h = ctx.hooks
+    assert ctx.sections["tokeneconomizer"]({"session_id": "s", "platform": "cli",
+                                            "cwd": str(work)}) == ""
+
+    def turn(tid, calls):
+        out = []
+        h["pre_llm_call"](session_id="s", turn_id=tid, is_first_turn=False)
+        for k, (name, args, result) in enumerate(calls):
+            if k == 3:                                   # a second call for the same turn
+                h["pre_llm_call"](session_id="s", turn_id=tid, is_first_turn=False)
+            failed = '"exit_code": 1' in result
+            out.append(h["transform_tool_result"](
+                tool_name=name, args=args, result=result, session_id="s", turn_id=tid,
+                status="error" if failed else "ok", error_message="exit 1" if failed else None))
+        h["on_session_end"](session_id="s", turn_id=tid, completed=True, interrupted=False,
+                            failed=False)
+        return out
+
+    for k in range(5):
+        turn(f"g{k}", [("read_file", {"path": "/r/a.py"}, '{"content": "ok"}')] * 8)
+    stuck = _stuck("hermes")
+    outs = turn("stuck", stuck)
+    redirected = [k for k, o in enumerate(outs) if o and "Process check (automated)" in o]
+    assert redirected and outs[redirected[0]].startswith(stuck[redirected[0]][2])
+    (rec,) = (tmp_path / "home").rglob("sessions/s.json")
+    turns = json.loads(rec.read_text())["turns"]
+    assert [(t["turn_key"], t["tool_calls"]) for t in turns] == [
+        (f"g{k}", 8) for k in range(5)] + [("stuck", len(stuck))]
+    assert turns[-1]["nudges"] == 1
+
+
+def test_the_hermes_shim_logs_a_launcher_that_is_missing_or_too_slow(tmp_path, monkeypatch):
+    monkeypatch.setenv("TOKENECONOMIZER_HOME", str(tmp_path / "home"))
+    shim = _load_hermes_shim()
+    monkeypatch.setattr(shim, "_scripts", lambda: None)
+    assert shim._run("te-hook", ["--host", "hermes"], "{}", 1) == ""
+    slow = tmp_path / "scripts"
+    slow.mkdir()
+    (slow / "te-hook").write_text("#!/bin/sh\nsleep 5\n")
+    (slow / "te-hook").chmod(0o755)
+    monkeypatch.setattr(shim, "_scripts", lambda: str(slow))
+    assert shim._run("te-hook", ["--host", "hermes"], "{}", 0.2) == ""
+    log = (tmp_path / "home" / "errors.log").read_text()
+    assert "no launchers found" in log and "no answer within 0.2 s" in log
+
+
+def test_a_finalized_hermes_subagent_is_forgotten(tmp_path, monkeypatch):
+    monkeypatch.setenv("TE_DISABLE", "1")                # no dispatcher needed here
+    ctx = _HermesCtx(str(tmp_path))
+    shim = _load_hermes_shim()
+    calls = []
+    monkeypatch.setattr(shim, "_hook", lambda p, *a: calls.append(p) or {})
+    shim.register(ctx)
+    ctx.hooks["subagent_start"](child_session_id="kid")
+    ctx.hooks["on_session_finalize"](session_id="kid", platform="subagent")
+    assert calls == []                                   # no SessionEnd for a subagent
+    ctx.hooks["pre_llm_call"](session_id="kid", turn_id="t")
+    assert [c["session_id"] for c in calls] == ["kid"]   # the id is no longer held
+
+
 def test_the_hermes_bundle_is_a_plugin_directory_on_its_own(tmp_path):
     out = tmp_path / "market"
     subprocess.run([sys.executable, os.path.join(REPO, "scripts", "build_plugin.py"),

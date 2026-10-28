@@ -53,14 +53,15 @@ def _truthy(v):
     return (v or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _log_error(where):
+def _log_error(where, detail=None):
+    """One entry in the plugin's errors.log: `detail`, else the exception being handled."""
     try:
         home = os.environ.get("TOKENECONOMIZER_HOME") or os.path.join(
             os.path.expanduser("~"), ".tokeneconomizer")
         os.makedirs(home, exist_ok=True)
         with open(os.path.join(home, "errors.log"), "a", encoding="utf-8") as fh:
             fh.write(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} hermes {where}\n"
-                     f"{traceback.format_exc()}\n")
+                     f"{detail or traceback.format_exc()}\n")
     except Exception:
         pass
 
@@ -83,12 +84,18 @@ def _run(script, args, stdin_text, timeout, extra_env=None):
     """One launcher run; its stdout, or "" if it is missing, fails to start or times out."""
     d = _scripts()
     if not d:
+        _log_error(script, f"no launchers found beside {HERE} (expected ../scripts or scripts)")
         return ""
     try:
         proc = subprocess.run([os.path.join(d, script)] + list(args), input=stdin_text,
                               capture_output=True, text=True, timeout=timeout,
                               env=dict(os.environ, **(extra_env or {})))
+    except subprocess.TimeoutExpired:
+        _log_error(script, f"{script} {' '.join(args[:3])}: no answer within {timeout} s; "
+                           f"killed")
+        return ""
     except (OSError, subprocess.SubprocessError):
+        _log_error(script)
         return ""
     return proc.stdout or ""
 
@@ -120,6 +127,7 @@ def _hermes_home():
 def register(ctx):
     subagents = set()           # session ids of `delegate_task` children
     platforms = {}              # session id -> platform, from on_session_start
+    opened = {}                 # session id -> the turn_id its last UserPromptSubmit opened
     locks = {}                  # session id -> lock: one session's calls fold in order
     locks_guard = threading.Lock()
 
@@ -184,11 +192,17 @@ def register(ctx):
 
     @_guarded()
     def pre_llm_call(session_id=None, turn_id=None, **_):
-        sid = str(session_id or "")
+        # Hermes fires this once per turn, before the turn's request loop
+        # (agent/turn_context.py:1185, from build_turn_context, conversation_loop.py:1660). A
+        # second call for the same turn must still not reopen it: that would reset the guard.
+        sid, turn = str(session_id or ""), str(turn_id or "")
         p = base(sid)
         if p is not None:
             with lock_for(sid):
-                _hook(dict(p, hook_event_name="UserPromptSubmit", prompt_id=str(turn_id or "")),
+                if turn and opened.get(sid) == turn:
+                    return None
+                opened[sid] = turn
+                _hook(dict(p, hook_event_name="UserPromptSubmit", prompt_id=turn),
                       SLOW_S, surface(sid))
         return None
 
@@ -238,6 +252,8 @@ def register(ctx):
         with locks_guard:
             locks.pop(sid, None)
         platforms.pop(sid, None)
+        opened.pop(sid, None)
+        subagents.discard(sid)
         return None
 
     @_guarded(default="te: the command failed; see ~/.tokeneconomizer/errors.log")
