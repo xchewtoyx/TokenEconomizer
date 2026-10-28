@@ -483,7 +483,9 @@ if (scenario === "main") {
 } else if (scenario === "exec") {
   // `openclaw agent exec`: one run, no `session_end`, then the process exits.
   out.detected = [["node", "openclaw", "gateway", "run"], ["node", "openclaw", "agent", "-m", "hi"],
-                  ["node", "openclaw", "agent", "--agent", "main", "exec", "fix it"]].map((a) => mod.oneShotExec(a));
+                  ["node", "openclaw", "agent", "--agent", "main", "exec", "fix it"],
+                  ["node", "openclaw", "--profile", "work", "agent", "exec", "fix it"],
+                  ["node", "openclaw", "--log-level", "debug", "gateway", "run"]].map((a) => mod.oneShotExec(a));
   process.argv = [process.argv[0], "/usr/lib/openclaw/openclaw.mjs", "agent", "exec", "--json", "fix it"];
   const ex = reg(await load(3));
   await ex.hooks.before_prompt_build({ prompt: "fix it", messages: [] }, ctxOf("X", "r1"));
@@ -642,7 +644,7 @@ def test_an_openclaw_agent_exec_run_is_ended_and_folded_when_its_process_exits(t
     Stop blocking and SessionEnd at exit, so the run is folded with its turn closed. Only argv
     marks such a process; the gateway's never reads `agent … exec`."""
     out, repo, home = _openclaw_node(tmp_path, "exec", TE_FOLD_SYNC="1")
-    assert out["detected"] == [False, False, True]
+    assert out["detected"] == [False, False, True, True, False]
     st = _openclaw_store(repo, home)
     sess = st.read(os.path.join("sessions", "X#1.json"))
     assert sess["end_reason"] == "exit"

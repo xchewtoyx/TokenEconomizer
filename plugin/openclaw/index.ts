@@ -63,9 +63,15 @@ const EXIT_MS = 5_000;
 export function oneShotExec(argv: string[] = process.argv): boolean {
   // shortcut: an option value spelled `exec` (`openclaw agent --local -m exec`) also counts; that
   // run is one-shot too, so it is only ended at its exit rather than by the sweep.
-  const words = argv.slice(2).filter((a) => !a.startsWith("-"));
+  const args = argv.slice(2), words: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (ROOT_VALUE_OPTIONS.has(args[i])) i++; // `--profile work agent exec`: `work` is no command
+    else if (!args[i].startsWith("-")) words.push(args[i]);
+  }
   return words[0] === "agent" && words.includes("exec");
 }
+// The root options that take a separate value (OpenClaw's `getRootOptionAwareCommandPath`).
+const ROOT_VALUE_OPTIONS = new Set(["--profile", "--log-level", "--container"]);
 
 // The names the dispatcher's mechanisms read (`loopguard/state.canon_tool`, `microskills/observe`).
 export const TOOL_NAMES: Record<string, string> = {
@@ -306,6 +312,10 @@ export default {
     const exec = oneShotExec();
     if (exec) {
       process.once("exit", () => {
+        // A run whose `agent_end` never logged it is gone with this process; nothing can add it
+        // later, so the session still ends, with a line saying what it lacks.
+        const open = [...runs.values()].length;
+        if (open) errorLine(`openclaw: exec exited with ${open} run(s) not yet logged`);
         for (const s of sessions.values()) {
           try {
             hookSync(s, { hook_event_name: "SessionEnd", reason: "exit" }, EXIT_MS);
