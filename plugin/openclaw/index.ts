@@ -6,31 +6,34 @@
  * (JSON in, JSON out), and the answer is applied with OpenClaw's own levers. All of the
  * mechanism logic lives in the dispatcher; this file only translates.
  *
- *   before_prompt_build (first per session)  -> SessionStart, then UserPromptSubmit; the facts it
- *                                               returns are kept for the session
+ *   before_prompt_build (first per segment)  -> SessionStart, then UserPromptSubmit; the facts it
+ *                                               returns are kept for the segment
  *   before_prompt_build (every prompt)       -> UserPromptSubmit; the facts go back as
  *                                               `appendSystemContext`, the same text every turn
  *   tool-result middleware                   -> PostToolUse; a redirect is appended to the result
  *                                               the model reads
  *   agent_end                                -> the turn's messages join this plugin's own
  *                                               session log (Pi format), then Stop
- *   session_end                              -> SessionEnd, which hands the session to a fold
+ *   session_end                              -> SessionEnd, which hands the segment to a fold
+ *
+ * An OpenClaw session can last for days (a chat keeps its session), while the dispatcher folds a
+ * session once, after it has been quiet for `fold.STALE_S`. So the dispatcher is shown segments:
+ * `<sessionId>#<n>`, each with its own log, and a prompt after a quiet stretch starts the next.
  *
  * SessionStart waits for the first prompt because `session_start` carries no workspace. A
- * session the shim meets with history already in it (a resumed one, or the first prompt after a
- * plugin reload) is started with `source: "resume"`, and the dispatcher hands back the text that
- * session was first given. The tool-result middleware runs before `after_tool_call` and before
- * the result reaches the model, so it sends PostToolUse itself and `after_tool_call` is not used.
- * No `before_tool_call`: the plugin never blocks a call.
+ * segment the shim meets again after a plugin reload is started with `source: "resume"`, and the
+ * dispatcher hands back the text that segment was first given. The tool-result middleware runs
+ * before `after_tool_call` and before the result reaches the model, so it sends PostToolUse
+ * itself and `after_tool_call` is not used. No `before_tool_call`: the plugin never blocks a call.
  *
  * Every handler fails open: any error, and a dispatcher that is missing, slow or broken, means
  * "no change". It does nothing under TE_SIDECALL=1 (the plugin's own side calls) or TE_DISABLE=1,
- * in incognito sessions, or on cron and heartbeat turns. `/te <command>` runs the `te` command
- * line for the session's repository.
+ * in incognito sessions, on cron and heartbeat turns, or on a runtime other than OpenClaw's own.
+ * `/te <command>` runs the `te` command line for the session's repository.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, utimesSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { disabled, hookOutput, runLauncher } from "./te-spawn.ts";
 
 const HOST = "openclaw";
@@ -40,6 +43,10 @@ const PROMPT_MS = 6_000;
 const TOOL_MS = 10_000;
 const END_MS = 20_000;
 const COMMAND_MS = 60_000;
+// A segment quiet this long gets no more turns: below `fold.STALE_S` (600 s), after which the
+// dispatcher may fold it, once. The next segment starts with the facts as they are then, so its
+// `appendSystemContext` may differ; a gap this long has outlived a provider's prompt cache anyway.
+export const QUIET_MS = 540_000;
 
 // The names the dispatcher's mechanisms read (`loopguard/state.canon_tool`, `microskills/observe`).
 export const TOOL_NAMES: Record<string, string> = {
@@ -51,14 +58,35 @@ export const TOOL_NAMES: Record<string, string> = {
   write: "create",
 };
 
-type Session = { cwd: string; facts: string; turn: string; runId: string; prompts: number; channel: string };
+type Session = { seg: string; cwd: string; facts: string; turn: string; runId: string; prompts: number; channel: string };
 
 export function stateRoot(): string {
   return process.env.TOKENECONOMIZER_HOME || join(homedir(), ".tokeneconomizer");
 }
 
-export function logPath(sid: string): string {
-  return join(stateRoot(), "hosts", HOST, "sessions", `${sid.replace(/[^\w.-]/g, "_")}.jsonl`);
+const sessionsDir = () => join(stateRoot(), "hosts", HOST, "sessions");
+const safe = (sid: string) => sid.replace(/[^\w.-]/g, "_");
+
+/** The dispatcher's session id for segment `n` of an OpenClaw session. */
+export const segment = (sid: string, n: number) => `${safe(sid)}#${n}`;
+
+export function logPath(seg: string): string {
+  return join(sessionsDir(), `${seg.replace(/[^\w.#-]/g, "_")}.jsonl`);
+}
+
+/** The highest segment number logged for an OpenClaw session (0: none). */
+export function lastSegment(sid: string): number {
+  const prefix = `${safe(sid)}#`;
+  let names: string[] = [];
+  try {
+    names = readdirSync(sessionsDir());
+  } catch {}
+  let n = 0;
+  for (const name of names) {
+    const m = name.startsWith(prefix) ? /^(\d+)\.jsonl$/.exec(name.slice(prefix.length)) : null;
+    if (m) n = Math.max(n, Number(m[1]));
+  }
+  return n;
 }
 
 function lines(path: string): any[] {
@@ -77,26 +105,68 @@ function lines(path: string): any[] {
   return out;
 }
 
-/** The repository directory a session log's header names ("" when there is no log yet). */
-export function loggedCwd(sid: string): string {
-  const head = lines(logPath(sid))[0];
+/** The repository directory a segment log's header names ("" when there is no log yet). */
+export function loggedCwd(seg: string): string {
+  const head = lines(logPath(seg))[0];
   return head?.type === "session" && typeof head.cwd === "string" ? head.cwd : "";
 }
 
-/** A directory inside a git checkout (a `.git` directory or file at it or above). */
-function inGit(dir: string | undefined): boolean {
-  for (let d = dir || ""; d; d = dirname(d)) {
-    if (existsSync(join(d, ".git"))) return true;
-    if (dirname(d) === d) break;
+/** Whether a segment's log was touched within `QUIET_MS`. */
+function fresh(seg: string): boolean {
+  try {
+    return Date.now() - statSync(logPath(seg)).mtimeMs < QUIET_MS;
+  } catch {
+    return false;
   }
-  return false;
 }
 
-function writeHeader(sid: string, cwd: string) {
-  const path = logPath(sid);
+function touch(seg: string) {
+  try {
+    const now = new Date();
+    utimesSync(logPath(seg), now, now);
+  } catch {}
+}
+
+/** `paths.is_git_entry`: a `.git` directory holding `HEAD`, or a `.git` file whose `gitdir:`
+ * names a directory that exists. */
+function isGitEntry(dot: string): boolean {
+  try {
+    if (statSync(dot).isDirectory()) return existsSync(join(dot, "HEAD"));
+    const line = readFileSync(dot, "utf8").slice(0, 4096).trim();
+    if (!line.startsWith("gitdir:")) return false;
+    const gitdir = line.slice(7).trim();
+    return statSync(isAbsolute(gitdir) ? gitdir : resolve(dirname(dot), gitdir)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** `paths.find_repo_root`: is `start` at or below a git checkout? The walk never climbs into a
+ * `GIT_CEILING_DIRECTORIES` entry, nor from below the home directory into it. */
+export function inRepo(start: string | undefined): boolean {
+  if (!start) return false;
+  const ceilings = new Set((process.env.GIT_CEILING_DIRECTORIES ?? "").split(":").filter(Boolean).map((c) => resolve(c)));
+  let home = "";
+  try {
+    home = realpathSync(process.env.HOME || homedir());
+  } catch {}
+  for (let cur = resolve(start); ; ) {
+    if (isGitEntry(join(cur, ".git"))) return true;
+    const parent = dirname(cur);
+    let real = parent;
+    try {
+      real = realpathSync(parent);
+    } catch {}
+    if (parent === cur || ceilings.has(parent) || (home && real === home)) return false;
+    cur = parent;
+  }
+}
+
+function writeHeader(seg: string, cwd: string) {
+  const path = logPath(seg);
   if (existsSync(path) && statSync(path).size > 0) return;
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  appendFileSync(path, JSON.stringify({ type: "session", version: 4, id: sid, timestamp: new Date().toISOString(), cwd }) + "\n");
+  appendFileSync(path, JSON.stringify({ type: "session", version: 4, id: seg, timestamp: new Date().toISOString(), cwd }) + "\n");
 }
 
 const keyOf = (m: any) => JSON.stringify([m?.role ?? null, m?.timestamp ?? null, m?.toolCallId ?? null]);
@@ -113,32 +183,39 @@ function normalized(m: any): any {
   return out;
 }
 
-/** Append the messages the log does not hold yet, as one linear `parentId` chain. What is
- * already written is read from the file, never from memory, so a plugin reload followed by
- * another `agent_end` appends nothing twice -- whether it passes the whole session or one turn.
+/** Append to segment `n` of session `sid` the messages no segment of it holds yet, as one linear
+ * `parentId` chain. What is already written is read from the files, never from memory, so a
+ * plugin reload followed by another `agent_end` appends nothing twice -- whether it passes the
+ * whole session or one turn -- and a new segment does not take its predecessors' messages.
  * Returns how many entries were appended. */
-export function appendMessages(sid: string, messages: unknown[]): number {
-  const path = logPath(sid);
+export function appendMessages(sid: string, n: number, messages: unknown[]): number {
+  const path = logPath(segment(sid, n));
   const entries = lines(path);
   if (entries[0]?.type !== "session") return 0;
+  const seen = new Set<string>();
+  // shortcut: reads every earlier segment on each agent_end; keep a key index if sessions grow huge.
+  for (let k = 1; k < n; k++) {
+    for (const e of lines(logPath(segment(sid, k)))) if (e?.type === "message") seen.add(keyOf(e.message));
+  }
   const written = entries.filter((e) => e?.type === "message");
-  const seen = new Set(written.map((e) => keyOf(e.message)));
+  for (const e of written) seen.add(keyOf(e.message));
   // The chain goes on from the last entry written, the leaf `pi_active_branch` starts from.
   let parent = written.length ? written[written.length - 1].id ?? null : null;
   // Past the highest id written, so an unreadable line skipped above cannot cause a repeat.
   const start = 1 + Math.max(0, ...written.map((e) => Number(String(e.id ?? "").slice(1)) || 0));
-  let n = start;
+  let next = start;
   let text = "";
   for (const m of messages ?? []) {
     if (!m || typeof m !== "object" || seen.has(keyOf(m))) continue;
     seen.add(keyOf(m));
-    const id = `m${n++}`;
+    const id = `m${next++}`;
     const ts = typeof (m as any).timestamp === "number" ? new Date((m as any).timestamp).toISOString() : new Date().toISOString();
     text += JSON.stringify({ type: "message", id, parentId: parent, timestamp: ts, message: normalized(m) }) + "\n";
     parent = id;
   }
   if (text) appendFileSync(path, text);
-  return n - start;
+  else touch(segment(sid, n));
+  return next - start;
 }
 
 /** The plugin's `scripts/` directory: under the plugin root when OpenClaw installed the whole
@@ -151,12 +228,19 @@ function scriptsDir(root: string): string {
 const ignored = (ctx: any) =>
   disabled() || !ctx?.sessionId || /:incognito-/i.test(String(ctx?.sessionKey ?? "")) || ["cron", "heartbeat"].includes(ctx?.trigger);
 
+// No hook context names its runtime; only the middleware's does (`ctx.runtime`). OpenClaw's own
+// runtime builds the prompt-hook context with `activeProjectKeys` (an array, empty outside a
+// repository); the Codex runtime's has none. A context without it is left alone.
+const embedded = (ctx: any) => Array.isArray(ctx?.activeProjectKeys);
+
 export default {
   id: "tokeneconomizer",
   name: "TokenEconomizer",
   description: "Repository facts learned from earlier sessions, and a guard for turns stuck in a failing loop.",
   register(api: any) {
     const scripts = scriptsDir(api.rootDir ?? api.resolvePath?.(".") ?? ".");
+    // OpenClaw session id -> its current segment. Only sessions started on OpenClaw's own runtime
+    // get here, so `agent_end`, the middleware and `/te` follow the prompt hook's runtime gate.
     const sessions = new Map<string, Session>();
     const resumed = new Set<string>();
     // Sessions whose tools run in a sandbox, where an exec's directory is a container path the
@@ -168,11 +252,46 @@ export default {
       if (typeof text === "string" && text) api.logger?.info?.(text);
     };
 
-    async function hook(s: Session, sid: string, payload: Record<string, unknown>, ms: number): Promise<any> {
+    async function hook(s: { seg: string; cwd: string; channel: string }, payload: Record<string, unknown>, ms: number): Promise<any> {
       if (disabled()) return {};
-      const body = { session_id: sid, transcript_path: logPath(sid), cwd: s.cwd, ...payload };
+      const body = { session_id: s.seg, transcript_path: logPath(s.seg), cwd: s.cwd, ...payload };
       const out = await runLauncher(join(scripts, "te-hook"), ["--host", HOST], JSON.stringify(body), { TE_OPENCLAW_CHANNEL: s.channel }, ms);
       return hookOutput(out);
+    }
+
+    const starting = new Map<string, Promise<Session | undefined>>();
+
+    /** Start the session's next segment (or, after a plugin reload, its still-fresh last one) and
+     * publish it once SessionStart has answered; undefined when it has no repository yet. */
+    async function startSegment(sid: string, ctx: any): Promise<Session | undefined> {
+      const n = lastSegment(sid);
+      const last = n ? segment(sid, n) : "";
+      const logged = last ? loggedCwd(last) : "";
+      // A segment still fresh on disk is this one again, after a plugin reload.
+      const again = Boolean(logged) && fresh(last);
+      const cwd = logged || found.get(sid) || (inRepo(ctx.workspaceDir) ? ctx.workspaceDir : "");
+      if (!cwd) return undefined;
+      const seg = again ? last : segment(sid, n + 1);
+      const s: Session = { seg, cwd, facts: "", turn: "", runId: "", prompts: 0, channel: String(ctx.channel ?? "") };
+      writeHeader(seg, cwd);
+      // Not "history in `messages`": a session whose first prompt ran outside a repository has
+      // history too, and was never given anything to be given back.
+      const carried = again || (n === 0 && resumed.has(sid));
+      const out = await hook(s, { hook_event_name: "SessionStart", source: carried ? "resume" : "startup" }, PROMPT_MS);
+      s.facts = out?.hookSpecificOutput?.additionalContext ?? "";
+      log(out?.systemMessage);
+      found.delete(sid);
+      sessions.set(sid, s);
+      return s;
+    }
+
+    /** The segment a session-wide command or end acts on: in memory, else the last one logged. */
+    function current(sid: string): { seg: string; cwd: string } | null {
+      const s = sessions.get(sid);
+      if (s) return s;
+      const n = lastSegment(sid);
+      const cwd = n ? loggedCwd(segment(sid, n)) : "";
+      return cwd ? { seg: segment(sid, n), cwd } : null;
     }
 
     api.on("session_start", (event: any) => {
@@ -186,36 +305,34 @@ export default {
       "before_prompt_build",
       async (event: any, ctx: any) => {
         try {
-          if (ignored(ctx)) return undefined;
+          if (ignored(ctx) || !embedded(ctx)) return undefined;
           const sid: string = ctx.sessionId;
           if (ctx.sandboxed) sandboxed.add(sid);
           let s = sessions.get(sid);
+          if (s && !fresh(s.seg)) s = undefined; // quiet for a fold's while: the next segment
           if (!s) {
-            // A log on disk means this session ran before (a resumed session, or a plugin reload).
-            const logged = loggedCwd(sid);
-            const cwd = logged || found.get(sid) || (inGit(ctx.workspaceDir) ? ctx.workspaceDir : "");
-            if (!cwd) return undefined; // no repository yet: an exec call may name one
-            s = { cwd, facts: "", turn: "", runId: "", prompts: 0, channel: String(ctx.channel ?? "") };
-            sessions.set(sid, s);
-            found.delete(sid);
-            writeHeader(sid, cwd);
-            // Not "history in `messages`": a session whose first prompt ran outside a repository
-            // has history too, and was never given anything to be given back.
-            const carried = Boolean(logged) || resumed.has(sid);
-            const out = await hook(s, sid, { hook_event_name: "SessionStart", source: carried ? "resume" : "startup" }, PROMPT_MS);
-            s.facts = out?.hookSpecificOutput?.additionalContext ?? "";
-            log(out?.systemMessage);
+            // One SessionStart per segment: a concurrent build waits for the one in flight.
+            let p = starting.get(sid);
+            if (!p) {
+              p = startSegment(sid, ctx).finally(() => starting.delete(sid));
+              starting.set(sid, p);
+            }
+            s = await p;
+            if (!s) return undefined; // no repository yet: an exec call may name one
           }
+          touch(s.seg);
           s.channel = String(ctx.channel ?? s.channel);
           // One prompt can be built more than once (a retry, a fallback model): one turn per run.
           const runId = String(ctx.runId ?? "");
           if (!runId || runId !== s.runId) {
             s.prompts += 1;
             s.runId = runId;
-            s.turn = `${sid}:${runId || s.prompts}`;
-            const out = await hook(s, sid, { hook_event_name: "UserPromptSubmit", prompt_id: s.turn, prompt: event?.prompt ?? "" }, PROMPT_MS);
+            s.turn = `${s.seg}:${runId || s.prompts}`;
+            const out = await hook(s, { hook_event_name: "UserPromptSubmit", prompt_id: s.turn, prompt: event?.prompt ?? "" }, PROMPT_MS);
+            // The repository map arrives on a segment's first prompt, before any text was sent,
+            // and joins the facts; later prompts' context never does, so the text stays the same.
             const extra = out?.hookSpecificOutput?.additionalContext;
-            if (extra) s.facts = s.facts ? `${s.facts}\n\n${extra}` : extra;
+            if (extra && s.prompts === 1) s.facts = s.facts ? `${s.facts}\n\n${extra}` : extra;
             log(out?.systemMessage);
           }
           return s.facts ? { appendSystemContext: s.facts } : undefined;
@@ -240,6 +357,7 @@ export default {
             }
             return undefined;
           }
+          touch(s.seg); // a turn at work is not a quiet segment
           const content = (event?.result?.content ?? [])
             .filter((c: any) => c?.type === "text")
             .map((c: any) => c.text)
@@ -247,7 +365,6 @@ export default {
           const isError = Boolean(event?.isError);
           const out = await hook(
             s,
-            ctx.sessionId,
             {
               hook_event_name: isError ? "PostToolUseFailure" : "PostToolUse",
               prompt_id: s.turn,
@@ -277,8 +394,10 @@ export default {
           if (ignored(ctx)) return undefined;
           const s = sessions.get(ctx.sessionId);
           if (!s) return undefined;
-          appendMessages(ctx.sessionId, event?.messages ?? []);
-          await hook(s, ctx.sessionId, { hook_event_name: "Stop", prompt_id: s.turn, stop_hook_active: false }, END_MS);
+          // shortcut: a single tool call longer than QUIET_MS can let its segment be folded under
+          // it; the turn's messages then go unlearned. Rare; a keep-alive timer would close it.
+          appendMessages(ctx.sessionId, Number(s.seg.slice(s.seg.lastIndexOf("#") + 1)), event?.messages ?? []);
+          await hook(s, { hook_event_name: "Stop", prompt_id: s.turn, stop_hook_active: false }, END_MS);
         } catch {}
         return undefined;
       },
@@ -291,14 +410,13 @@ export default {
         try {
           const sid = event?.sessionId ?? ctx?.sessionId;
           if (disabled() || !sid) return undefined;
-          const cwd = sessions.get(sid)?.cwd || loggedCwd(sid);
+          const cur = current(sid);
           sessions.delete(sid);
           resumed.delete(sid);
           sandboxed.delete(sid);
           found.delete(sid);
-          if (!cwd) return undefined;
-          const s: Session = { cwd, facts: "", turn: "", runId: "", prompts: 0, channel: "" };
-          await hook(s, sid, { hook_event_name: "SessionEnd", reason: event?.reason ?? "unknown" }, 1_500);
+          if (!cur) return undefined;
+          await hook({ ...cur, channel: "" }, { hook_event_name: "SessionEnd", reason: event?.reason ?? "unknown" }, 1_500);
         } catch {}
         return undefined;
       },
@@ -311,11 +429,10 @@ export default {
       acceptsArgs: true,
       handler: async (ctx: any) => {
         try {
-          const sid = String(ctx?.sessionId ?? "");
-          const cwd = (sid && (sessions.get(sid)?.cwd || loggedCwd(sid))) || "";
-          if (!cwd) return { text: "te: this session has no repository yet (it starts on a prompt in one)." };
+          const cur = current(String(ctx?.sessionId ?? ""));
+          if (!cur) return { text: "te: this session has no repository yet (it starts on a prompt in one)." };
           const argv = (ctx?.args || "status").trim().split(/\s+/).filter(Boolean);
-          const out = await runLauncher(join(scripts, "te"), ["--host", HOST, "--cwd", cwd, ...argv], "", { TE_SESSION_ID: sid }, COMMAND_MS);
+          const out = await runLauncher(join(scripts, "te"), ["--host", HOST, "--cwd", cur.cwd, ...argv], "", { TE_SESSION_ID: cur.seg }, COMMAND_MS);
           return { text: out.trim() || "te: no output (is Python 3.10+ on PATH?)" };
         } catch {
           return { text: "te: failed" };

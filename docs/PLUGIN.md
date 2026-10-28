@@ -508,7 +508,15 @@ re-running the test and found the missing fixture. With every run piped (`npm te
   after a plugin reload (started again from its log, as a resume); a repeated build of one run
   opens no second turn; overlapping `agent_end` batches and a reload append each message once,
   in one linear `parentId` chain, with `exec` logged as `bash`; cron, heartbeat, incognito and
-  repository-less sessions leave nothing behind. Logs in that shape taught the missing-`pytest`
+  repository-less sessions leave nothing behind, and so do turns on the Codex runtime (whose
+  prompt-hook context lacks the `activeProjectKeys` OpenClaw's own runtime sets: no hook context
+  names its runtime). A workspace counts as a checkout by `paths.find_repo_root`'s rule. Two
+  prompt builds at once start a session once, and five prompts get the same text. A session
+  quiet for 9 minutes goes on in a new segment (`<sessionId>#<n>`, its own log and fold), since
+  the dispatcher folds a session once, after `fold.STALE_S`; a test folds one segment, then the
+  next with only its own turn's usage. A new segment starts with the facts as they are then, so
+  `appendSystemContext` may change at that boundary, after a gap longer than a provider's prompt
+  cache lasts. Logs in that shape taught the missing-`pytest`
   fact over four sessions, injected at the fifth session's start.
 * **Unverified:** everything a model turn shows — that the middleware's appended text is what
   the model reads, notices, usage on real `agent_end` messages, `/te` inside a chat, the side
@@ -536,7 +544,9 @@ All state is local, under `$TOKENECONOMIZER_HOME` (default `~/.tokeneconomizer`)
 per repository and host: the mechanisms' own state, `ledger.jsonl` (one priced record per
 session), `events.jsonl` (every injection, redirect and still-stuck notice), and per-session guard state.
 On OpenClaw it also holds the plugin's copy of each session's messages
-(`hosts/openclaw/sessions/`), conversation text included.
+(`hosts/openclaw/sessions/`), conversation text included. **These logs are kept**: nothing
+deletes them after a fold (the spec's §4 asks for deletion; not decided yet). Delete
+`$TOKENECONOMIZER_HOME/hosts/openclaw/sessions/` to remove them.
 Uninstalling the plugin leaves this directory; delete it to forget. `te repos` lists what it
 holds.
 
@@ -607,8 +617,10 @@ open-vocabulary. On a repository you do not trust, leave micro-skills off (the d
 * **Pi** — tool pruning is not planned there, since Pi declares only four tools by default.
 * **OpenClaw** — not yet run with a model (§3). Tool pruning is phase 2 (`toolsAllow`). A
   session whose workspace is not a git checkout joins its repository from its second prompt.
-  The plugin's own session logs (`hosts/openclaw/sessions/`) are kept, not deleted after the
-  fold, because a long-lived OpenClaw session goes on after a fold of its quiet stretch.
+  The plugin's own session logs (`$TOKENECONOMIZER_HOME/hosts/openclaw/sessions/`, default
+  `~/.tokeneconomizer/hosts/openclaw/sessions/`) are kept after the fold, with their
+  conversation text (§4). A single tool call longer than 9 minutes can let its segment fold
+  under it, and that turn goes unlearned.
 * **Known gaps:**
   * `codex exec` prints no hook messages, so a headless Codex run shows no notice; `te status`
     counts it afterwards. On Claude Code the notice reaches the conversation and `claude -p`'s

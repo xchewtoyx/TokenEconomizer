@@ -121,6 +121,15 @@ Notes:
 - **Runtimes.** Support the embedded `openclaw` runtime only in v1. On the `codex` runtime the
   transcripts are Codex-native, and `toolsAllow` and parameter rewrites are rejected [V]. There,
   every handler returns `undefined` and `te doctor` says the runtime is unsupported.
+  **Settled:** no hook context names its runtime; only the middleware's does (`ctx.runtime`,
+  `src/plugins/agent-tool-result-middleware-types.ts`), and `llm_output.harnessId` arrives after
+  the model call. OpenClaw's own runtime builds the prompt-hook context with `activeProjectKeys`
+  (`src/agents/embedded-agent-runner/run/attempt-prompt-build.ts:139-150`); the Codex runtime's
+  has none (`extensions/codex/src/app-server/run-attempt-context.ts:100-130`). So
+  `before_prompt_build` acts only when that field is an array, and `agent_end`, the middleware,
+  `session_end` and `/te` act only on sessions it started. That field is not documented as a
+  runtime marker [?]: if a later OpenClaw drops it, the plugin goes quiet, never wrong. `te
+  doctor` does not report the runtime.
 - **Code Mode** (`tools.codeMode`) hides tool calls behind `exec` with
   `toolKind: "code_mode_exec"` [V]. The shim maps such calls to `bash` like any other exec. The
   loop guard sees one opaque command per batch. Document this.
@@ -356,6 +365,12 @@ Deviations in v1, and why:
 - The plugin's log is not deleted after a fold (§4 Privacy): an OpenClaw session outlives a fold
   of its quiet stretch, and the reload-safe dedupe reads that file.
 - The plain-object entry instead of `definePluginEntry` (§1).
+- **Segments.** The dispatcher folds a session once, after `fold.STALE_S` (600 s) of quiet, and
+  an OpenClaw session can last for days. The plugin shows the dispatcher segments,
+  `<sessionId>#<n>`, each with its own log: a prompt after 9 minutes without activity (the log's
+  mtime, touched on every prompt and tool call, so reload-safe) starts the next one with
+  `source: "startup"`. `agent_end` dedupes across all of a session's segments, so a new segment
+  does not take its predecessors' messages. The core is unchanged.
 
 ## 10. Tests
 

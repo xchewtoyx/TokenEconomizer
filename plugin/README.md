@@ -326,7 +326,9 @@ and whether `allowConversationAccess` is on. In a session, `/te status`, `/te mi
 - The facts go into the system prompt as `appendSystemContext`, the same text on every prompt.
 - The plugin keeps its own copy of each session's messages, in
   `~/.tokeneconomizer/hosts/openclaw/sessions/`, because OpenClaw's store cannot be read from
-  the standard library. It holds conversation text; delete it with the rest of the state.
+  the standard library. It holds conversation text, and it is kept after the plugin has learned
+  from it; delete that directory to remove it. A session that goes quiet for 9 minutes carries
+  on as a new segment (`<session>#2`, …) with its own log, and gets the facts as they are then.
 - A plugin cannot show you a notice on OpenClaw, so the plugin's notices go to the gateway log,
   and a turn that is still stuck after the loop guard's redirect is reported through the model's
   reply: send **/stop** to stop it.
