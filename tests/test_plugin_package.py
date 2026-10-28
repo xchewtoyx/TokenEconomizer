@@ -430,6 +430,18 @@ if (scenario === "main") {
   await api.hooks.agent_end({ messages: [u, asst(2, "c1"), u2, asst(11, "c2")] }, ctxOf("L", "r2"));
   out.segments = mod.lastSegment("L");
   out.second = read(mod.segment("L", 2)).slice(1).map((e) => e.message.role);
+} else if (scenario === "ended") {
+  // A turn, 9.5 quiet minutes (past the segment limit, short of the fold's), a turn, the end.
+  const u = { role: "user", content: "one", timestamp: 1 };
+  const u2 = { role: "user", content: "two", timestamp: 10 };
+  await api.hooks.before_prompt_build({ prompt: "one", messages: [] }, ctxOf("M", "r1"));
+  await api.hooks.agent_end({ messages: [u, asst(2, "c1")] }, ctxOf("M", "r1"));
+  const old = (Date.now() - 570_000) / 1000;
+  utimesSync(mod.logPath(mod.segment("M", 1)), old, old);
+  await api.hooks.before_prompt_build({ prompt: "two", messages: [u, asst(2, "c1")] }, ctxOf("M", "r2"));
+  await api.hooks.agent_end({ messages: [u, asst(2, "c1"), u2, asst(11, "c2")] }, ctxOf("M", "r2"));
+  await api.hooks.session_end({ sessionId: "M", reason: "idle" }, { sessionId: "M" });
+  out.segments = mod.lastSegment("M");
 } else if (scenario === "repo") {
   // A workspace below a versioned home is not a checkout, nor is one with an empty `.git`.
   const h = join(home, "user");
@@ -531,6 +543,29 @@ def test_an_openclaw_session_that_outlives_its_fold_goes_on_in_a_new_segment(tmp
     ledger = {r["session_id"]: r for r in st.read_lines("ledger.jsonl")}
     assert set(ledger) == {"L#1", "L#2"}
     assert ledger["L#1"]["requests"] == ledger["L#2"]["requests"] == 1
+
+
+def test_a_segment_change_ends_the_quiet_segment_so_both_are_folded(tmp_path):
+    """The next segment begins after 9 quiet minutes, before the fold would pick up the old one
+    (10): it is ended there, so it folds then, and a session that stops after the next turn
+    leaves no segment waiting for a SessionStart that may never come."""
+    out, repo, home = _openclaw_node(tmp_path, "ended", TE_FOLD_SYNC="1")
+    assert out["segments"] == 2
+    st = _openclaw_store(repo, home)
+    sess = {k: st.read(os.path.join("sessions", f"M#{k}.json")) for k in (1, 2)}
+    assert sess[1]["end_reason"] == "segment" and sess[2]["end_reason"] == "idle"
+    # The second end's fold runs detached in the plugin; here, inline, past the hook's budget,
+    # so another session's start picks it up as an ended session.
+    from tokeneconomizer.plugin import hook
+    import io
+    env = {"TOKENECONOMIZER_HOME": str(home), "TE_FOLD_SYNC": "1", "TE_MICROSKILLS": "envfacts",
+           "GIT_CEILING_DIRECTORIES": str(tmp_path), "PATH": os.environ.get("PATH", "")}
+    hook.main(["--host", "openclaw"], io.StringIO(json.dumps({
+        "hook_event_name": "SessionStart", "session_id": "other", "source": "startup",
+        "transcript_path": "", "cwd": str(repo)})), io.StringIO(), env)
+    ledger = {r["session_id"]: r for r in st.read_lines("ledger.jsonl")}
+    assert set(ledger) == {"M#1", "M#2"}
+    assert ledger["M#1"]["requests"] == ledger["M#2"]["requests"] == 1
 
 
 def test_the_openclaw_plugin_takes_a_checkout_as_the_core_does(tmp_path):

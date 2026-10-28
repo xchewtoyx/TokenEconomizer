@@ -369,7 +369,8 @@ Deviations in v1, and why:
   an OpenClaw session can last for days. The plugin shows the dispatcher segments,
   `<sessionId>#<n>`, each with its own log: a prompt after 9 minutes without activity (the log's
   mtime, touched on every prompt and tool call, so reload-safe) starts the next one with
-  `source: "startup"`. `agent_end` dedupes across all of a session's segments, so a new segment
+  `source: "startup"`, after a `SessionEnd` (`reason: "segment"`; the core only records the
+  reason) for the quiet one, serialised behind its `agent_end`, so it folds at once. `agent_end` dedupes across all of a session's segments, so a new segment
   does not take its predecessors' messages. The core is unchanged.
 
 ## 10. Tests

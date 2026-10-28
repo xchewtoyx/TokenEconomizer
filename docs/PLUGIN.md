@@ -512,7 +512,8 @@ re-running the test and found the missing fixture. With every run piped (`npm te
   prompt-hook context lacks the `activeProjectKeys` OpenClaw's own runtime sets: no hook context
   names its runtime). A workspace counts as a checkout by `paths.find_repo_root`'s rule. Two
   prompt builds at once start a session once, and five prompts get the same text. A session
-  quiet for 9 minutes goes on in a new segment (`<sessionId>#<n>`, its own log and fold), since
+  quiet for 9 minutes goes on in a new segment (`<sessionId>#<n>`, its own log and fold; the
+  quiet one is ended there, so it folds at once), since
   the dispatcher folds a session once, after `fold.STALE_S`; a test folds one segment, then the
   next with only its own turn's usage. A new segment starts with the facts as they are then, so
   `appendSystemContext` may change at that boundary, after a gap longer than a provider's prompt

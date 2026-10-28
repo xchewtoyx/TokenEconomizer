@@ -260,6 +260,14 @@ export default {
     }
 
     const starting = new Map<string, Promise<Session | undefined>>();
+    // Per session, the work that must not overlap a segment change: `agent_end` and the change.
+    const queues = new Map<string, Promise<unknown>>();
+    function serial<T>(sid: string, fn: () => Promise<T>): Promise<T> {
+      const run = (queues.get(sid) ?? Promise.resolve()).catch(() => {}).then(fn);
+      queues.set(sid, run);
+      run.finally(() => queues.get(sid) === run && queues.delete(sid)).catch(() => {});
+      return run;
+    }
 
     /** Start the session's next segment (or, after a plugin reload, its still-fresh last one) and
      * publish it once SessionStart has answered; undefined when it has no repository yet. */
@@ -273,6 +281,11 @@ export default {
       if (!cwd) return undefined;
       const seg = again ? last : segment(sid, n + 1);
       const s: Session = { seg, cwd, facts: "", turn: "", runId: "", prompts: 0, channel: String(ctx.channel ?? "") };
+      if (logged && !again) {
+        // The quiet segment ends here, so the dispatcher folds it now rather than when, and
+        // if, another session starts after it has been quiet for `fold.STALE_S`.
+        await hook({ seg: last, cwd: logged, channel: s.channel }, { hook_event_name: "SessionEnd", reason: "segment" }, PROMPT_MS);
+      }
       writeHeader(seg, cwd);
       // Not "history in `messages`": a session whose first prompt ran outside a repository has
       // history too, and was never given anything to be given back.
@@ -314,7 +327,7 @@ export default {
             // One SessionStart per segment: a concurrent build waits for the one in flight.
             let p = starting.get(sid);
             if (!p) {
-              p = startSegment(sid, ctx).finally(() => starting.delete(sid));
+              p = serial(sid, () => startSegment(sid, ctx)).finally(() => starting.delete(sid));
               starting.set(sid, p);
             }
             s = await p;
@@ -396,8 +409,10 @@ export default {
           if (!s) return undefined;
           // shortcut: a single tool call longer than QUIET_MS can let its segment be folded under
           // it; the turn's messages then go unlearned. Rare; a keep-alive timer would close it.
-          appendMessages(ctx.sessionId, Number(s.seg.slice(s.seg.lastIndexOf("#") + 1)), event?.messages ?? []);
-          await hook(s, { hook_event_name: "Stop", prompt_id: s.turn, stop_hook_active: false }, END_MS);
+          await serial(ctx.sessionId, async () => {
+            appendMessages(ctx.sessionId, Number(s.seg.slice(s.seg.lastIndexOf("#") + 1)), event?.messages ?? []);
+            await hook(s, { hook_event_name: "Stop", prompt_id: s.turn, stop_hook_active: false }, END_MS);
+          });
         } catch {}
         return undefined;
       },
