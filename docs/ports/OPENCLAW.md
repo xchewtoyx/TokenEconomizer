@@ -172,7 +172,14 @@ already are: session version 4 [V]):
 - **On `agent_end`:** append the turn's `messages` the host passes (already decompressed). Each
   entry is `{"type":"message","id":…,"parentId":<previous id>,"timestamp":…,"message":m}`. The
   `parentId` chain is required: `trace.pi_active_branch` walks it from the last entry
-  (`tokeneconomizer/trace/pi.py:31`). Messages already written (tracked by count) are skipped.
+  (`tokeneconomizer/trace/pi.py:31`). Messages already written are skipped.
+  - That state comes from the log file on disk, never from memory, because a plugin reload
+    wipes memory. Before appending, the shim reads the log's message entries.
+  - If `agent_end` passes the whole session's messages, the first N are skipped, where N is
+    the number of entries already written.
+  - If it passes only the turn's messages [?], an entry is skipped when its
+    `(role, timestamp, toolCallId)` is already in the log.
+  - Either way, a reload followed by a repeated `agent_end` appends nothing twice.
 - **Tool names are normalized as they are written.** Each `toolCall` block's `name` gets the
   §3 mapping (`exec`/`bash` → `bash` with `arguments.command`, and so on) before it lands in
   the log. `pi_session_to_claude` copies names unchanged, and the micro-skill observer reads
@@ -284,7 +291,8 @@ OpenClaw config changes.
   - the shared spawn helper is the one Pi uses.
 - **A Node unit test** in the style of the existing `carriedSection` extraction: feed `agent_end`
   twice with overlapping messages, and check that the log's `parentId` chain and the skip-count
-  are right.
+  are right. Repeat with a fresh shim instance between the two calls, which simulates a reload,
+  and check that nothing is appended twice.
 - **Recorded sessions** (CLAUDE.md): before release, record trap sessions on a real OpenClaw
   gateway with an OpenRouter model, on the embedded runtime, and check the fold and injection
   against them.

@@ -132,7 +132,7 @@ writer.
 
 | Function | Query | Output |
 |---|---|---|
-| `hermes_session_to_claude(tp, out)` | `messages WHERE session_id=? AND active=1 ORDER BY id` | Claude transcript lines. Each assistant `tool_calls` entry becomes a `tool_use` block, with the tool name mapped as in §3. The matching `role='tool'` row becomes a `tool_result`, with `is_error` set when `exit_code != 0` or `error` is set. Every call gets `cwd` from `sessions.cwd`. Returns the number of calls, or `None` if the row is missing. |
+| `hermes_session_to_claude(tp, out)` | `messages WHERE session_id=? AND active=1 ORDER BY id` | Claude transcript lines. Each assistant `tool_calls` entry becomes a `tool_use` block, with the tool name mapped as in §3. The matching `role='tool'` row becomes a `tool_result`, with `is_error` set when the result JSON has a non-null `exit_code` other than 0, or a non-empty `error`. A tool whose result has no `exit_code` (anything but `terminal`) is never marked as failed for that reason alone. Every call gets `cwd` from `sessions.cwd`. Returns the number of calls, or `None` if the row is missing. |
 | `hermes_prompt_count(tp)` | `COUNT(*) … role='user' AND active=1` | an int |
 | `hermes_session_usage(tp)` | the `sessions` row | `model`; `requests = api_call_count`; `input_tokens`; `cache_read_input_tokens = cache_read_tokens`; `cache_creation_input_tokens = cache_write_tokens`; `output_tokens`; `cost_usd_vendor = actual_cost_usd or estimated_cost_usd` |
 
