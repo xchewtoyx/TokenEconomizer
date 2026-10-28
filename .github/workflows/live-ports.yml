@@ -140,7 +140,7 @@ jobs:
           openclaw models set "openrouter/$LIVE_MODEL"
           # A cap on each request's output; OpenClaw has no turn or total-token cap.
           openclaw config set agents.defaults.params '{"maxTokens": 4096}'
-          openclaw plugins install --link "$CODE/plugin/openclaw" --accept-capabilities
+          openclaw plugins install --link "$CODE/plugin/openclaw" --accept-capabilities --force
           openclaw plugins enable tokeneconomizer
           openclaw config set plugins.entries.tokeneconomizer.hooks.allowConversationAccess true
           "$CODE/plugin/scripts/te" --host openclaw doctor || true
