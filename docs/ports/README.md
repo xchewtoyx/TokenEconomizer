@@ -1,5 +1,9 @@
 # Porting TokenEconomizer to Hermes Agent and OpenClaw
 
+**Branching:** all port work lands on the long-running `claw-port` branch, and every port PR
+targets `claw-port`, never `main`. `main` stays clean so that syncing from upstream is never
+blocked.
+
 This directory holds the research and the implementation specs for two new hosts:
 
 - [`HERMES.md`](HERMES.md): the spec for Hermes Agent (Nous Research). Researched at
