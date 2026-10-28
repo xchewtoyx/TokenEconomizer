@@ -303,12 +303,152 @@ def test_the_plugin_directory_is_also_a_pi_package():
     (root_ext,) = root["pi"]["extensions"]
     assert os.path.realpath(os.path.join(os.path.dirname(PLUGIN), root_ext)) == \
         os.path.realpath(os.path.join(PLUGIN, ext))
-    assert {k: v for k, v in root.items() if k != "pi"} == {k: v for k, v in pkg.items()
-                                                           if k != "pi"}
+    # (The root is also the OpenClaw plugin `openclaw plugins install git:` installs; see below.)
+    assert {k: v for k, v in root.items() if k not in ("pi", "openclaw")} == \
+        {k: v for k, v in pkg.items() if k != "pi"}
     # no lockfile: Claude Code installs a plugin's npm dependencies only when one exists,
     # and this package has none to install (the Pi API is a peer dependency)
     assert not any(os.path.exists(os.path.join(PLUGIN, f)) for f in
                    ("package-lock.json", "npm-shrinkwrap.json", "bun.lock", "bun.lockb"))
+
+
+def test_the_openclaw_plugin_manifests_agree_and_it_never_blocks_a_call():
+    """The OpenClaw plugin is `plugin/openclaw/` for a linked install and the repository root for
+    `openclaw plugins install git:...`, which installs the clone's root: the two manifests are the
+    same, and both packages name the same entry file."""
+    here = os.path.join(PLUGIN, "openclaw")
+    manifest = _json(here, "openclaw.plugin.json")
+    assert manifest == _json(REPO, "openclaw.plugin.json")
+    assert manifest["id"] == "tokeneconomizer" and manifest["activation"] == {"onStartup": True}
+    assert manifest["contracts"] == {"agentToolResultMiddleware": ["openclaw"]}
+    pkg, root = _json(here, "package.json"), _json(REPO, "package.json")
+    assert pkg["type"] == "module"
+    (ext,) = pkg["openclaw"]["extensions"]
+    (root_ext,) = root["openclaw"]["extensions"]
+    assert os.path.realpath(os.path.join(here, ext)) == os.path.realpath(os.path.join(REPO, root_ext))
+    assert pkg["openclaw"]["compat"] == root["openclaw"]["compat"]
+    from tokeneconomizer.plugin import cli
+    assert pkg["openclaw"]["compat"]["pluginApi"] == ">=" + cli.OPENCLAW_PLUGIN_API
+    src = open(os.path.join(here, ext), encoding="utf-8").read()
+    assert 'runLauncher(join(scripts, "te-hook"), ["--host", HOST]' in src and 'HOST = "openclaw"' in src
+    # Not `before_tool_call`, which fails CLOSED when a handler throws or times out.
+    assert set(re.findall(r'api\.on\(\s*"(\w+)"', src)) == {
+        "session_start", "before_prompt_build", "agent_end", "session_end"}
+    assert "before_tool_call" not in src.replace("`before_tool_call`", "")
+    assert "carriedSection" not in src                    # Pi's sections are not OpenClaw's
+
+
+def test_both_extensions_spawn_through_the_one_shared_helper():
+    """Pi imports `plugin/shared/te-spawn.ts`; OpenClaw carries a byte-identical copy, so a
+    linked `plugin/openclaw/` imports nothing from outside its own directory."""
+    shared = open(os.path.join(PLUGIN, "shared", "te-spawn.ts"), encoding="utf-8").read()
+    assert open(os.path.join(PLUGIN, "openclaw", "te-spawn.ts"), encoding="utf-8").read() == shared
+    pi = open(os.path.join(PLUGIN, "pi", "tokeneconomizer.ts"), encoding="utf-8").read()
+    oc = open(os.path.join(PLUGIN, "openclaw", "index.ts"), encoding="utf-8").read()
+    assert 'from "../shared/te-spawn.ts"' in pi and 'from "./te-spawn.ts"' in oc
+    assert "spawn(" not in pi and "spawn(" not in oc
+
+
+OPENCLAW_DRIVER = r"""
+import { mkdtempSync, readFileSync, existsSync } from "node:fs";
+const [ext, home, repo] = process.argv.slice(1);
+process.env.TOKENECONOMIZER_HOME = home;
+const load = async (v) => (await import(ext + "?v=" + v));
+const mod = await load(1);
+const read = (sid) => readFileSync(mod.logPath(sid), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+const out = {};
+
+// The log writer: overlapping agent_end batches, then a fresh module (a reload) repeating one.
+const u = { role: "user", content: "fix it", timestamp: 1 };
+const a = { role: "assistant", timestamp: 2, model: "m", usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 },
+            content: [{ type: "toolCall", id: "c1", name: "exec", arguments: { command: "pytest -q" } }] };
+const r = { role: "toolResult", toolCallId: "c1", toolName: "exec", isError: true, timestamp: 3,
+            content: [{ type: "text", text: "boom" }] };
+const u2 = { role: "user", content: "again", timestamp: 4 };
+const reg = (m) => {
+  const api = { rootDir: process.argv[4], on: (n, h, o) => (api.hooks[n] = h), hooks: {}, logger: { info: (t) => out.logged = t },
+                registerAgentToolResultMiddleware: (h, o) => { api.mw = h; api.mwOpts = o; },
+                registerCommand: (c) => (api.cmd = c) };
+  m.default.register(api);
+  return api;
+};
+const api = reg(mod);
+out.hooks = Object.keys(api.hooks).sort();
+out.mwOpts = api.mwOpts;
+out.cmdName = api.cmd.name;
+const ctx = { sessionId: "S1", sessionKey: "agent:main:main", workspaceDir: repo, channel: "webchat", runId: "r1", trigger: "user" };
+out.first = await api.hooks.before_prompt_build({ prompt: "fix it", messages: [] }, ctx);
+out.again = await api.hooks.before_prompt_build({ prompt: "fix it", messages: [] }, ctx);
+out.mw = await api.mw({ toolCallId: "c1", toolName: "exec", args: { command: "pytest -q" }, isError: true,
+                       result: { content: [{ type: "text", text: "boom" }], details: { exitCode: 1, cwd: repo } } },
+                     { runtime: "openclaw", sessionId: "S1" });
+await api.hooks.agent_end({ messages: [u, a] }, ctx);
+await api.hooks.agent_end({ messages: [u, a, r] }, ctx);
+const fresh = reg(await load(2));                         // a plugin reload: nothing in memory
+await fresh.hooks.agent_end({ messages: [u, a, r] }, ctx); // no session known: nothing written
+out.reloaded = await fresh.hooks.before_prompt_build({ prompt: "again", messages: [u, a, r] }, { ...ctx, runId: "r2" });
+await fresh.hooks.agent_end({ messages: [r, u2] }, { ...ctx, runId: "r2" });
+const log = read("S1");
+out.header = log[0];
+out.chain = log.slice(1).map((e) => [e.id, e.parentId]);
+out.roles = log.slice(1).map((e) => e.message.role);
+out.names = [log[2].message.content[0].name, log[3].message.toolName];
+out.cmd = await fresh.cmd.handler({ sessionId: "S1", args: "status" });
+out.nocmd = await fresh.cmd.handler({ sessionId: "nope" });
+out.cron = await fresh.hooks.before_prompt_build({ prompt: "x", messages: [] }, { ...ctx, sessionId: "S2", trigger: "cron" });
+out.incognito = await fresh.hooks.before_prompt_build({ prompt: "x", messages: [] },
+  { ...ctx, sessionId: "S3", sessionKey: "agent:main:dashboard:incognito-1" });
+out.noRepo = await fresh.hooks.before_prompt_build({ prompt: "x", messages: [] }, { ...ctx, sessionId: "S4", workspaceDir: home });
+out.noLog = existsSync(mod.logPath("S2")) || existsSync(mod.logPath("S3")) || existsSync(mod.logPath("S4"));
+console.log(JSON.stringify(out));
+"""
+
+
+def test_the_openclaw_plugin_logs_each_message_once_across_reloads_and_starts_from_the_log(tmp_path):
+    """The plugin, loaded by Node with a stand-in for OpenClaw's `api`, against the real
+    dispatcher: a session in a git checkout starts on its first prompt; a repeated build of the
+    same run opens no second turn; `agent_end` batches that overlap, and a reload, append each
+    message once to one linear `parentId` chain with the tool names renamed; after the reload the
+    session is started again from its log, as a resume; cron, incognito and repository-less
+    sessions leave nothing behind."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    home = tmp_path / "home"
+    from tokeneconomizer.plugin.paths import repo_identity, repo_state_dir
+    from tokeneconomizer.plugin.store import Store
+    env = dict(os.environ, TOKENECONOMIZER_HOME=str(home))
+    st = Store(repo_state_dir(repo_identity(str(repo), env), "openclaw", env))
+    st.write("injection.json", {"rendered": "Facts:\n- one", "rendered_ids": ["a"]})
+    ext = os.path.join(PLUGIN, "openclaw", "index.ts")
+    run = subprocess.run([node, "--experimental-strip-types", "--no-warnings", "--input-type=module",
+                          "-e", OPENCLAW_DRIVER, ext, str(home), str(repo), os.path.join(PLUGIN, "openclaw")],
+                         capture_output=True, text=True, timeout=120,
+                         env=dict(os.environ, TE_SIDECALL="", TE_DISABLE="", TE_MICROSKILLS="envfacts",
+                                  GIT_CEILING_DIRECTORIES=str(tmp_path)))
+    if run.returncode and "strip-types" in run.stderr:
+        pytest.skip("this node cannot load TypeScript")
+    assert run.returncode == 0, run.stderr
+    out = json.loads(run.stdout)
+    assert out["hooks"] == ["agent_end", "before_prompt_build", "session_end", "session_start"]
+    assert out["mwOpts"] == {"runtimes": ["openclaw"]} and out["cmdName"] == "te"
+    # the same text on every prompt, and again after the reload, from the stored start
+    assert out["first"] == out["again"] == out["reloaded"] == {"appendSystemContext": "Facts:\n- one"}
+    assert out.get("mw") is None                                    # no redirect for one call
+    assert out["header"]["type"] == "session" and out["header"]["cwd"] == str(repo)
+    ids = [i for i, _ in out["chain"]]
+    assert out["chain"] == [list(p) for p in zip(ids, [None] + ids[:-1])]         # linear, no branches
+    assert out["roles"] == ["user", "assistant", "toolResult", "user"]  # each message once
+    assert out["names"] == ["bash", "bash"]
+    assert str(repo) in out["cmd"]["text"] and "no repository" in out["nocmd"]["text"]
+    assert out.get("cron") is out.get("incognito") is out.get("noRepo") is None
+    assert not out["noLog"]
+    # What the dispatcher recorded: one session, started, then started again from its log.
+    sess = st.read(os.path.join("sessions", "S1.json"))
+    assert sess["source"] == "resume" and sess["cwd"] == str(repo)
+    assert [t["turn_key"] for t in sess["turns"]] == ["S1:r1", "S1:r2"]     # one turn per run
 
 
 def test_the_plugin_carries_the_core_as_symlinks_an_install_copy_follows(tmp_path):

@@ -1,0 +1,12 @@
+{
+  "name": "tokeneconomizer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TokenEconomizer for OpenClaw: repository facts learned from earlier sessions, and a guard for turns stuck in a failing loop.",
+  "license": "Apache-2.0",
+  "openclaw": {
+    "extensions": ["./index.ts"],
+    "compat": { "pluginApi": ">=2026.10.8" }
+  }
+}

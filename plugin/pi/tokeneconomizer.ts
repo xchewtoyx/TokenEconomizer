@@ -23,9 +23,9 @@
  * calls) or TE_DISABLE=1. `/te <command>` runs the `te` command line for this repository.
  */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { disabled, hookOutput, runLauncher } from "../shared/te-spawn.ts";
 
 const HERE = (() => {
   try {
@@ -38,8 +38,6 @@ const SCRIPTS = join(HERE, "..", "scripts");
 const HOOK_TIMEOUT_MS = 60_000;
 const SECTION = "tokeneconomizer";
 
-const truthy = (v: string | undefined) => ["1", "true", "yes", "on"].includes((v ?? "").trim().toLowerCase());
-
 /** Run one of the plugin's launchers with `input` on stdin; resolve to its stdout. */
 function run(
   script: string,
@@ -48,45 +46,13 @@ function run(
   mode: string,
   extra: Record<string, string> = {},
 ): Promise<string> {
-  return new Promise((resolve) => {
-    let out = "";
-    let child;
-    try {
-      child = spawn(join(SCRIPTS, script), args, {
-        env: { ...process.env, TE_PI_MODE: mode, ...extra },
-        stdio: ["pipe", "pipe", "ignore"],
-      });
-    } catch {
-      resolve("");
-      return;
-    }
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      resolve("");
-    }, HOOK_TIMEOUT_MS);
-    child.stdout.on("data", (d: Buffer) => (out += d.toString()));
-    child.on("error", () => {
-      clearTimeout(timer);
-      resolve("");
-    });
-    child.on("close", () => {
-      clearTimeout(timer);
-      resolve(out);
-    });
-    child.stdin.on("error", () => {});
-    child.stdin.end(input);
-  });
+  return runLauncher(join(SCRIPTS, script), args, input, { TE_PI_MODE: mode, ...extra }, HOOK_TIMEOUT_MS);
 }
 
 /** One dispatcher call; `{}` (no change) on any failure. */
 async function hook(payload: Record<string, unknown>, mode: string): Promise<any> {
-  if (truthy(process.env.TE_SIDECALL) || truthy(process.env.TE_DISABLE)) return {};
-  const out = await run("te-hook", ["--host", "pi"], JSON.stringify(payload), mode);
-  try {
-    return JSON.parse(out.trim().split("\n").pop() || "{}") ?? {};
-  } catch {
-    return {};
-  }
+  if (disabled()) return {};
+  return hookOutput(await run("te-hook", ["--host", "pi"], JSON.stringify(payload), mode));
 }
 
 /** A notice in the UI; on stderr in print and JSON modes, which have no UI and keep stdout for

@@ -16,6 +16,10 @@
       "./plugin/pi/tokeneconomizer.ts"
     ]
   },
+  "openclaw": {
+    "extensions": ["./plugin/openclaw/index.ts"],
+    "compat": { "pluginApi": ">=2026.10.8" }
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   }

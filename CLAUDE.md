@@ -1,6 +1,6 @@
 # TokenEconomizer
 
-A plugin for Claude Code, Codex, the Copilot CLI and Pi that reads finished sessions and changes
+A plugin for Claude Code, Codex, the Copilot CLI, Pi and OpenClaw that reads finished sessions and changes
 what later sessions in the same repository pay for: micro-skills, tool pruning, and a loop guard.
 See `README.md` for the overview and the method, `docs/PLUGIN.md` for the design and the verified
 agent behavior, and `docs/ARCHITECTURE.md` for how the package fits together.
@@ -10,19 +10,22 @@ agent behavior, and `docs/ARCHITECTURE.md` for how the package fits together.
   - `microskills/` — learn repository facts from finished sessions; render the injected block
   - `toolprune/` — unused-tool evidence and the deny-list proposal; Codex capability packages
   - `loopguard/` — the per-call failure-loop guard and its per-repository envelope
-  - `trace/` — each agent's session-log format (Claude Code, Codex, Copilot CLI, Pi)
+  - `trace/` — each agent's session-log format (Claude Code, Codex, Copilot CLI, Pi; OpenClaw's
+    plugin writes Pi's)
   - `plugin/` — the runtime: hook dispatch, per-repository state, settings, the `te` CLI
   - `config.py`, `ledger.py`, `pricing.py`, `domain.py`, `stage.py` — shared by all three
 - `plugin/` — the installable plugin directory: manifests per agent, hook files, launchers
   (`scripts/te`, `scripts/te-hook`), slash commands (`slash-commands/`, named in the Claude Code
   and Copilot manifests, since Codex would turn a `commands/` folder into duplicate skills), Codex
-  skills (`codex-skills/`, Codex having no plugin slash commands), the Pi extension; `lib/` links
-  the package
+  skills (`codex-skills/`, Codex having no plugin slash commands), the Pi extension, the
+  OpenClaw plugin (`openclaw/`), the spawn helper both use (`shared/`, copied into `openclaw/`);
+  `lib/` links the package
 - `experiments/` — benchmark-only: `te_bench/` (adapters, arms, facade, benchmark-only
   controllers), `te_harness/` (Docker runners), `scripts/`, `workloads/`, its own `tests/`;
   its `README.md` is the run book
 - `package.json` — the repository as a Pi package (`pi install git:github.com/…`); it names
-  the same extension as `plugin/package.json`, which a test pins
+  the same extension as `plugin/package.json`, which a test pins; with `openclaw.plugin.json`
+  beside it, it is also the OpenClaw plugin that `openclaw plugins install git:…` installs
 - `scripts/build_plugin.py` — a self-contained plugin bundle for marketplace installs
 - `tests/` — offline tests for the package and the plugin
 

@@ -487,6 +487,34 @@ steering message (a `custom_message` of type `tokeneconomizer`), after which it 
 re-running the test and found the missing fixture. With every run piped (`npm test 2>&1 | tail
 -n 8`), each counted as failing and the judge found the turn stuck (0.90).
 
+**OpenClaw 2026.10.8 — read from source, loaded but not yet run with a model** (source at
+`openclaw/openclaw@4a0ab09`, the npm release `dc2523e`; the spec and its citations are in
+[`ports/OPENCLAW.md`](ports/OPENCLAW.md)):
+
+* `plugin/openclaw/index.ts` is a native OpenClaw plugin that speaks the dispatcher's protocol on
+  OpenClaw's behalf, as the Pi extension does on Pi. It registers `session_start`,
+  `before_prompt_build`, `agent_end` and `session_end`, one tool-result middleware for the
+  `openclaw` runtime, and `/te`; no `before_tool_call`, which fails closed.
+* **Verified (the release, no model):** `openclaw plugins install --link plugin/openclaw
+  --accept-capabilities`, `enable` and `config set …allowConversationAccess true` load it with
+  no diagnostics; `plugins inspect --runtime` lists the four hooks, the command and the
+  middleware contract, with `rootDir` the linked directory. `te --host openclaw doctor` read the
+  version and the grant. The side call's `agent exec` accepted the tool-denying config and
+  stopped only for want of a model login. The release's `agent exec` has no
+  `--config-override`, which the source has; the side call falls back to a config file that
+  includes the person's own.
+* **Verified (tests, the real dispatcher, a stand-in for OpenClaw's `api`):** a session in a git
+  checkout starts on its first prompt and gets the same `appendSystemContext` on every prompt and
+  after a plugin reload (started again from its log, as a resume); a repeated build of one run
+  opens no second turn; overlapping `agent_end` batches and a reload append each message once,
+  in one linear `parentId` chain, with `exec` logged as `bash`; cron, heartbeat, incognito and
+  repository-less sessions leave nothing behind. Logs in that shape taught the missing-`pytest`
+  fact over four sessions, injected at the fifth session's start.
+* **Unverified:** everything a model turn shows — that the middleware's appended text is what
+  the model reads, notices, usage on real `agent_end` messages, `/te` inside a chat, the side
+  call's answer, and the `git:` install of the repository root (whose `npm install` also fetches
+  the Pi package named as a peer dependency).
+
 **How the guard reads a test run, 2026-10-26.** A command line's exit status is its last
 command's, so it may not be the test run's: `npm test 2>&1 | tail -n 8` exits with `tail`'s,
 `npm test || true` and `python -m unittest; echo "exit=$?"` with 0, and `pytest -q; git diff`
@@ -507,6 +535,8 @@ authored again under a new id; the experiments' prompt names the ids alone, as t
 All state is local, under `$TOKENECONOMIZER_HOME` (default `~/.tokeneconomizer`), one directory
 per repository and host: the mechanisms' own state, `ledger.jsonl` (one priced record per
 session), `events.jsonl` (every injection, redirect and still-stuck notice), and per-session guard state.
+On OpenClaw it also holds the plugin's copy of each session's messages
+(`hosts/openclaw/sessions/`), conversation text included.
 Uninstalling the plugin leaves this directory; delete it to forget. `te repos` lists what it
 holds.
 
@@ -575,6 +605,10 @@ open-vocabulary. On a repository you do not trust, leave micro-skills off (the d
   already found its cause and was working around it; since 2026-10-25 the judge decides every
   redirect but the backstop's, which still counts.
 * **Pi** — tool pruning is not planned there, since Pi declares only four tools by default.
+* **OpenClaw** — not yet run with a model (§3). Tool pruning is phase 2 (`toolsAllow`). A
+  session whose workspace is not a git checkout joins its repository from its second prompt.
+  The plugin's own session logs (`hosts/openclaw/sessions/`) are kept, not deleted after the
+  fold, because a long-lived OpenClaw session goes on after a fold of its quiet stretch.
 * **Known gaps:**
   * `codex exec` prints no hook messages, so a headless Codex run shows no notice; `te status`
     counts it afterwards. On Claude Code the notice reaches the conversation and `claude -p`'s
