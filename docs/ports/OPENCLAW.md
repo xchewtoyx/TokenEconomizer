@@ -203,7 +203,9 @@ already are: session version 4 [V]):
     the number of entries already written.
   - If it passes only the turn's messages [?: it passes the attempt's `messagesSnapshot`,
     `src/agents/embedded-agent-runner/run/attempt-finalize.ts:367-380`], an entry is skipped when its
-    `(role, timestamp, toolCallId)` is already in the log.
+    `(role, timestamp, toolCallId)` is already in the log. **Changed:** two replies can share a
+    millisecond, so a message is known by a hash of its whole logged content, counted: a batch
+    skips as many copies of a message as the log holds.
   - Either way, a reload followed by a repeated `agent_end` appends nothing twice.
 - **Tool names are normalized as they are written.** Each `toolCall` block's `name` gets the
   §3 mapping (`exec`/`bash` → `bash` with `arguments.command`, and so on) before it lands in

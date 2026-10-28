@@ -458,6 +458,14 @@ if (scenario === "main") {
   await api.hooks.session_end({ sessionId: "N", reason: "idle" }, { sessionId: "N" });
   out.first = read(mod.segment("N", 1)).slice(1).map((e) => e.message.role);
   out.second = read(mod.segment("N", 2)).slice(1).map((e) => e.message.role);
+} else if (scenario === "sameMs") {
+  // Two replies in one millisecond, logged by a whole-session batch, then again by a per-run one.
+  const u = { role: "user", content: "go", timestamp: 5 };
+  const batch = [u, asst(5, "c1"), asst(5, "c2")];
+  await api.hooks.before_prompt_build({ prompt: "go", messages: [] }, ctxOf("Q", "r1"));
+  await api.hooks.agent_end({ messages: batch }, ctxOf("Q", "r1"));
+  await api.hooks.agent_end({ messages: batch.slice(1) }, ctxOf("Q", "r1"));
+  out.path = mod.logPath(mod.segment("Q", 1));
 } else if (scenario === "repo") {
   // A workspace below a versioned home is not a checkout, nor is one with an empty `.git`.
   const h = join(home, "user");
@@ -593,6 +601,18 @@ def test_a_segment_is_ended_only_after_its_last_run_is_logged(tmp_path):
     ledger = {r["session_id"]: r for r in st.read_lines("ledger.jsonl")}
     assert ledger["N#1"]["requests"] == 1                # folded after the run was logged
     assert not (home / "errors.log").exists() or "not yet logged" not in (home / "errors.log").read_text()
+
+
+def test_two_replies_in_one_millisecond_are_both_logged_and_priced(tmp_path):
+    """The log knows a message by its content, not by (role, timestamp, toolCallId): two
+    assistant messages that share a millisecond are two entries, each with its usage, and a
+    repeated batch adds neither again."""
+    from tokeneconomizer import trace
+    out, repo, home = _openclaw_node(tmp_path, "sameMs")
+    entries = [json.loads(ln) for ln in open(out["path"])][1:]
+    assert [e["message"]["role"] for e in entries] == ["user", "assistant", "assistant"]
+    usage = trace.pi_session_usage(out["path"])
+    assert usage["requests"] == 2 and usage["output_tokens"] == 4
 
 
 def test_the_openclaw_plugin_takes_a_checkout_as_the_core_does(tmp_path):

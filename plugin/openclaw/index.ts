@@ -32,6 +32,7 @@
  * `/te <command>` runs the `te` command line for the session's repository.
  */
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, utimesSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { disabled, hookOutput, runLauncher } from "./te-spawn.ts";
@@ -179,7 +180,9 @@ function writeHeader(seg: string, cwd: string) {
   appendFileSync(path, JSON.stringify({ type: "session", version: 4, id: seg, timestamp: new Date().toISOString(), cwd }) + "\n");
 }
 
-const keyOf = (m: any) => JSON.stringify([m?.role ?? null, m?.timestamp ?? null, m?.toolCallId ?? null]);
+// A message is known by its whole content as logged: OpenClaw gives messages no id they all carry
+// (`responseId` is optional), and two replies can share a millisecond.
+const keyOf = (logged: any) => createHash("sha1").update(JSON.stringify(logged)).digest("hex");
 
 /** A message as the log keeps it: tool names renamed to the ones the dispatcher reads. */
 function normalized(m: any): any {
@@ -202,13 +205,14 @@ export function appendMessages(sid: string, n: number, messages: unknown[]): num
   const path = logPath(segment(sid, n));
   const entries = lines(path);
   if (entries[0]?.type !== "session") return 0;
-  const seen = new Set<string>();
+  // How many times each message is logged already: a batch skips that many copies of it, in
+  // order, so the same message twice (a whole-session batch repeats both) is still logged twice.
+  const seen = new Map<string, number>();
+  const count = (e: any) => e?.type === "message" && seen.set(keyOf(e.message), (seen.get(keyOf(e.message)) ?? 0) + 1);
   // shortcut: reads every earlier segment on each agent_end; keep a key index if sessions grow huge.
-  for (let k = 1; k < n; k++) {
-    for (const e of lines(logPath(segment(sid, k)))) if (e?.type === "message") seen.add(keyOf(e.message));
-  }
+  for (let k = 1; k < n; k++) lines(logPath(segment(sid, k))).forEach(count);
   const written = entries.filter((e) => e?.type === "message");
-  for (const e of written) seen.add(keyOf(e.message));
+  written.forEach(count);
   // The chain goes on from the last entry written, the leaf `pi_active_branch` starts from.
   let parent = written.length ? written[written.length - 1].id ?? null : null;
   // Past the highest id written, so an unreadable line skipped above cannot cause a repeat.
@@ -216,11 +220,17 @@ export function appendMessages(sid: string, n: number, messages: unknown[]): num
   let next = start;
   let text = "";
   for (const m of messages ?? []) {
-    if (!m || typeof m !== "object" || seen.has(keyOf(m))) continue;
-    seen.add(keyOf(m));
+    if (!m || typeof m !== "object") continue;
+    const message = normalized(m);
+    const key = keyOf(message);
+    const left = seen.get(key) ?? 0;
+    if (left > 0) {
+      seen.set(key, left - 1);
+      continue;
+    }
     const id = `m${next++}`;
     const ts = typeof (m as any).timestamp === "number" ? new Date((m as any).timestamp).toISOString() : new Date().toISOString();
-    text += JSON.stringify({ type: "message", id, parentId: parent, timestamp: ts, message: normalized(m) }) + "\n";
+    text += JSON.stringify({ type: "message", id, parentId: parent, timestamp: ts, message }) + "\n";
     parent = id;
   }
   if (text) appendFileSync(path, text);
