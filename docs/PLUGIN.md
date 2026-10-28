@@ -502,6 +502,31 @@ the judge's gate opens in 18.1%, 15.8% and 5.8% of them.
 The plugin's proposer prompt lists each fact it holds with its claim, so a fact it has is not
 authored again under a new id; the experiments' prompt names the ids alone, as the paper ran it.
 
+**Hermes Agent — NOT verified on a running Hermes.** Read from the source at `main` `6696c7b0`
+(2026-10-28, release date 2026.9.24); the spec and its citations are
+[`docs/ports/HERMES.md`](ports/HERMES.md). No agent turn has been run: no model key was
+available. Offline, the plugin's tests drive the shim (`plugin/hermes/`) against the real
+launcher and fold synthetic `state.db` files. One smoke test used Hermes' own plugin manager,
+from that source (on Python 3.13; Hermes asks for 3.14), with the plugin linked into
+`$HERMES_HOME/plugins/` and enabled in `config.yaml`: it was discovered and loaded, registered
+its six hooks, its section and `/te`; rendering the section reached the dispatcher (the session
+was recorded with its `state.db#<id>` path, from Hermes' own `get_hermes_home`), a
+`transform_tool_result` passed the result through unchanged, and `/te status` answered.
+
+* Read in source, not yet seen working: the system-prompt section function gets the session id
+  and cwd; a string returned from `transform_tool_result` replaces the result the model reads;
+  `status` is `ok` or `error`; `on_session_end` fires after every turn; a `delegate_task` child
+  is marked by `subagent_start` and `platform="subagent"`; compaction re-renders the section,
+  and may move the session to a new id; `hermes -z --usage-file` reports a run's tokens; a
+  plugin directory linked into `$HERMES_HOME/plugins/` is discovered.
+* Unverified, with the conservative choice made meanwhile: whether `post_message` notices show
+  on the CLI, TUI and Desktop (the still-stuck notice is also relayed through the model); whether
+  the facts in the section reach the model and survive a resume; whether `-t context_engine`
+  leaves a side call without tools; whether `turn_id` in `transform_tool_result` is the one
+  `pre_llm_call` saw; the read-only open of Hermes' own WAL database while the gateway writes it;
+  how a gateway restart finalizes sessions. Recorded trap sessions through OpenRouter are owed
+  before a release.
+
 ## 4. State and privacy
 
 All state is local, under `$TOKENECONOMIZER_HOME` (default `~/.tokeneconomizer`), one directory

@@ -64,6 +64,8 @@ mechanisms:
   itself.
 
 TokenEconomizer is a plugin for **Claude Code**, **Codex**, the **GitHub Copilot CLI** and **Pi**.
+A port to **Hermes Agent** is in progress and not yet checked on a running Hermes
+([plugin/README.md](plugin/README.md#hermes-agent-unverified)).
 Each italic letter above is a setting, shown with its default ([Settings](#settings)), and each
 mechanism can be turned on or off. The plugin announces each action in one line, and if any part
 of it fails, your session carries on as if it were not installed. Its model calls (the fact

@@ -67,6 +67,8 @@ class LiveController:
             return f"/tokeneconomizer:{name}"
         if self.host.name == "pi":
             return f"/te {name}"                 # registered by the Pi extension
+        if self.host.name == "hermes":
+            return f"/te {name}"                 # registered by the Hermes plugin
         if self.host.name == "codex":
             return f"$tokeneconomizer:{name}"    # the plugin's Codex skills
         return f"te --host {self.host.name} {name}"

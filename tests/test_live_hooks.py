@@ -317,6 +317,12 @@ def _stuck(host, n=40):
     if host in ("claude", "codex"):
         return stuck_calls(n, host if host == "codex" else None)
     fail = "FAILED tests/test_a.py::test_x - AssertionError: assert 1 == 2"
+    if host == "hermes":
+        return [("patch", {"path": "/r/pkg/a.py", "old_string": "x", "new_string": "y"},
+                 json.dumps({"success": True}))
+                if k % 2 == 0 else ("terminal", {"command": "pytest -q"}, json.dumps(
+                    {"output": fail, "exit_code": 1, "error": None}))
+                for k in range(n)]
     if host == "pi":
         return [("edit", {"path": "/r/pkg/a.py", "oldText": "x", "newText": "y"}, {"content": "ok"})
                 if k % 2 == 0 else ("bash", {"command": "pytest -q"},
@@ -330,7 +336,7 @@ def _stuck(host, n=40):
             for k in range(n)]
 
 
-@pytest.mark.parametrize("host", ["claude", "codex", "copilot", "pi"])
+@pytest.mark.parametrize("host", ["claude", "codex", "copilot", "pi", "hermes"])
 @pytest.mark.parametrize("mode", ["interactive", "headless"])
 @pytest.mark.parametrize("setting", ["nudge", "stop"])
 def test_the_guard_redirects_then_tells_the_person_how_to_stop_on_every_agent(
@@ -342,7 +348,7 @@ def test_the_guard_redirects_then_tells_the_person_how_to_stop_on_every_agent(
     for k in range(5):
         _guard_turn(env, repo, "s", f"g{k}", green, host)
     outs = _guard_turn(env, repo, "s", "stuck", _stuck(host), host)
-    ctx_key = (lambda o: o.get("additionalContext")) if host == "copilot" else (
+    ctx_key = (lambda o: o.get("additionalContext")) if host in ("copilot", "hermes") else (
         lambda o: (o.get("hookSpecificOutput") or {}).get("additionalContext"))
     shown = (lambda o: " ".join(o.get("progress") or [])) if host == "copilot" else (
         lambda o: o.get("systemMessage") or "")
@@ -352,9 +358,9 @@ def test_the_guard_redirects_then_tells_the_person_how_to_stop_on_every_agent(
     hint = hosts.HOSTS[host]().stop_hint(mode == "headless")
     assert stuck[0].endswith(hint)
     assert not any("continue" in o or "stopReason" in o for o in outs)  # never a stop
-    if host == "claude":
-        # Claude Code keeps hook messages out of the main view, so the notice also goes to the
-        # model, word for word, to pass on in its reply; the redirect comes first.
+    if hosts.HOSTS[host].relays_notices:
+        # Claude Code keeps hook messages out of the main view (and Hermes may), so the notice
+        # also goes to the model, word for word, to pass on in its reply; the redirect first.
         redirect, relay = to_model
         assert "Process check (automated)" in redirect
         assert stuck[0] in relay and "it does not change your task" in relay
@@ -934,6 +940,26 @@ def test_pi_print_mode_counts_as_headless_for_the_stop_hint(env, repo):
     notice = next(o["systemMessage"] for o in outs
                   if "still looks stuck" in o.get("systemMessage", ""))
     assert notice.endswith(hosts.HOSTS["pi"]().stop_hint(True))
+
+
+# ---- Hermes Agent, through the payloads its plugin sends ------------------------------------
+def test_hermes_learns_from_its_state_db_and_injects_at_the_next_start(env, repo, tmp_path):
+    from fixtures.hermes import hermes_state_db, trap_messages
+    db = str(tmp_path / "state.db")
+    starts = []
+    for i in range(5):
+        tp = hermes_state_db(db, {"id": f"h{i}", "cwd": repo, "model": "claude-haiku-4-5",
+                                  "input_tokens": 30, "output_tokens": 150,
+                                  "cache_read_tokens": 3000, "cache_write_tokens": 300,
+                                  "api_call_count": 3, "ended_at": time.time(),
+                                  "messages": trap_messages(repo, i)})
+        assert hosts.detect({"transcript_path": tp}).name == "hermes"
+        starts.append(run_session(env, repo, f"h{i}", tp, host="hermes"))
+    assert all(s == {} for s in starts[:4])
+    assert "`python -m pytest …` works." in starts[4]["additionalContext"]
+    assert "/te microskills" in starts[4]["systemMessage"]      # Hermes' own command name
+    rec = store_for(env, repo, "hermes").read_lines("ledger.jsonl")[0]
+    assert rec["requests"] == 3 and rec["priced_by"] == "model"
 
 
 # ---- GitHub Copilot CLI, through the payloads it sends -------------------------------------

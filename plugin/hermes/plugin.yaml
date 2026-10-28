@@ -1,0 +1,12 @@
+name: tokeneconomizer
+version: "0.1.0"
+description: "TokenEconomizer: learns repository facts from finished sessions and adds them to new sessions' system prompt, and watches each turn for a failing loop (redirect, then a notice). /te shows what it learned and its settings."
+author: "TokenEconomizer authors"
+requires_env: []
+provides_hooks:
+  - on_session_start
+  - subagent_start
+  - pre_llm_call
+  - transform_tool_result
+  - on_session_end
+  - on_session_finalize

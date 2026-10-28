@@ -187,6 +187,10 @@ class Host:
     def settle(self, transcript_path):
         """Wait, if this host needs to, until the finished session's log is complete."""
 
+    def last_activity(self, transcript_path):
+        """When the session's log last changed (raises OSError when it cannot be told)."""
+        return os.path.getmtime(transcript_path)
+
     def tool_usage(self, trace_path):
         return trace.tool_usage(trace_path)
 
@@ -414,6 +418,85 @@ class Copilot(Host):
             time.sleep(0.25)
 
 
+def hermes_home(env=None):
+    env = os.environ if env is None else env
+    return env.get("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
+
+
+class Hermes(Host):
+    """Hermes Agent (NousResearch/hermes-agent), through the plugin in `plugin/hermes/`.
+
+    Hermes loads Python plugins into its own process; the shim there spawns this dispatcher per
+    event with a Claude-shaped payload, as the Pi extension does, and applies the answer with
+    Hermes' levers. What it sends:
+
+      * `SessionStart` from Hermes' system-prompt section, whose text is the facts; Hermes
+        renders it once per session and freezes it (so `keeps_start_context`);
+      * `prompt_id` is Hermes' own `turn_id`;
+      * `tool_response` is the tool's result string; a terminal result is JSON `{output,
+        exit_code, error}`, so the exit code is real;
+      * `transcript_path` is `"<HERMES_HOME>/state.db#<session id>"` (`trace.hermes`);
+      * the session's surface in `TE_HERMES_SURFACE` on the hook's environment.
+    """
+    name = "hermes"
+    prompt_context = False             # the facts live in the frozen system-prompt section
+    keeps_start_context = True
+    # Whether `ctx.post_message` reaches every surface is unverified, so the still-stuck notice
+    # also goes through the model and is seen wherever the reply is.
+    relays_notices = True
+    # Hermes' docs (website/docs/user-guide/cli.md): `/stop` cancels the turn and its
+    # foreground work; Ctrl+C interrupts in the terminal.
+    interrupt = "Send /stop to stop it (in the terminal, Ctrl+C also interrupts it)."
+    end_run = "Press Ctrl+C to end the run."
+
+    def turn_key(self, p):
+        return str(p.get("prompt_id") or "")
+
+    def headless(self, env, transcript=None):
+        # `hermes -z` and `hermes chat -q` mark their process (hermes_cli/oneshot.py); cron and
+        # API runs have no person reading. A messaging chat is interactive: /stop works there.
+        return (str(env.get("HERMES_SINGLE_QUERY_SESSION", "")).strip() == "1"
+                or env.get("TE_HERMES_SURFACE", "") in ("cron", "api_server", "kanban", "tool",
+                                                         "webhook"))
+
+    def tool_call(self, p):
+        args = p.get("tool_input") if isinstance(p.get("tool_input"), dict) else {}
+        name, args = trace.hermes_tool(str(p.get("tool_name") or ""), args)
+        raw = p.get("tool_response")
+        text, code, _failed = trace.hermes_result(
+            raw if isinstance(raw, str) else json.dumps(raw) if raw is not None else "")
+        if not text and p.get("error"):
+            text = str(p["error"])
+        return name, args, text[:RESULT_CAP], code
+
+    def context(self, event, text):
+        return {"additionalContext": text}
+
+    def mechanism_trace(self, transcript_path, workdir):
+        out = os.path.join(workdir, "hermes_trace.jsonl")
+        n = trace.hermes_session_to_claude(transcript_path, out)
+        return out if n is not None else None
+
+    def prompt_count(self, transcript_path):
+        return trace.hermes_prompt_count(transcript_path)
+
+    def session_usage(self, transcript_path):
+        return trace.hermes_session_usage(transcript_path)
+
+    def last_activity(self, transcript_path):
+        # Not the database file's mtime: every session of the profile writes that file.
+        t = trace.hermes_last_activity(transcript_path)
+        if t is None:
+            raise OSError(f"no Hermes session at {transcript_path}")
+        return t
+
+    def settle(self, transcript_path, wait_s=2.0):
+        # `on_session_finalize` can run before Hermes stamps the session's `ended_at`.
+        deadline = time.time() + wait_s
+        while time.time() < deadline and not trace.hermes_ended(transcript_path):
+            time.sleep(0.1)
+
+
 _PROMPT_FLAG = re.compile(r"\s(?:-p|--prompt)(?:[\s=]|$)")
 
 
@@ -437,7 +520,8 @@ def _ancestor_args(limit=4):
     return out
 
 
-HOSTS = {"claude": ClaudeCode, "codex": Codex, "copilot": Copilot, "pi": Pi}
+HOSTS = {"claude": ClaudeCode, "codex": Codex, "copilot": Copilot, "pi": Pi,
+         "hermes": Hermes}
 
 
 def default_host(env=None, recent=None):
@@ -459,9 +543,11 @@ def detect(payload, env=None, hint=None):
     """The adapter for this hook call: an explicit `hint`, else inferred from the payload."""
     if hint in HOSTS:
         return HOSTS[hint]()
+    tp = str((payload or {}).get("transcript_path") or "")
+    if "state.db#" in tp:
+        return Hermes()
     if "turn_id" in (payload or {}):
         return Codex()
-    tp = str((payload or {}).get("transcript_path") or "")
     if os.path.basename(tp).startswith("rollout-") or f"{os.sep}.codex{os.sep}" in tp:
         return Codex()
     if f"{os.sep}session-state{os.sep}" in tp and tp.endswith("events.jsonl"):
