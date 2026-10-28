@@ -303,7 +303,7 @@ def last_activity(ctx):
             continue
         tp = (ctx.store.read(os.path.join("sessions", name)) or {}).get("transcript")
         try:
-            latest = max(latest, os.path.getmtime(tp)) if tp else latest
+            latest = max(latest, ctx.host.last_activity(tp)) if tp else latest
         except OSError:
             pass
     return latest
@@ -441,7 +441,8 @@ def pending_sessions(ctx, exclude=(), stale_s=STALE_S, now=None):
         sess = ctx.store.read(os.path.join("sessions", name)) or {}
         tp = sess.get("transcript") or ""
         try:
-            quiet = now - os.path.getmtime(tp) >= stale_s
+            # A path for most hosts; Hermes' `state.db#<id>` asks its database instead.
+            quiet = now - ctx.host.last_activity(tp) >= stale_s
         except OSError:
             quiet = False
         if sess.get("ended") or quiet:

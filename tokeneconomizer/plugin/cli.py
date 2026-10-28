@@ -653,8 +653,9 @@ def cmd_doctor(args):
         ok = False
     import shutil as _sh
     # Only the agents installed here: a Codex-only machine has no Claude Code catalog to probe.
-    agents = [h for h in ("claude", "codex", "copilot", "pi", "openclaw") if _sh.which(h)]
-    print(f"agents      {', '.join(agents) or 'none of claude, codex, copilot, pi, openclaw on PATH'}")
+    names = ("claude", "codex", "copilot", "pi", "hermes", "openclaw")
+    agents = [h for h in names if _sh.which(h)]
+    print(f"agents      {', '.join(agents) or 'none of ' + ', '.join(names) + ' on PATH'}")
     for h in agents:
         pause = sidecall.paused(h, root)
         if pause:
@@ -697,6 +698,13 @@ def cmd_doctor(args):
             pkgs = []
         mine = [p for p in pkgs if "tokeneconomizer" in json.dumps(p).lower()]
         print(f"pi          package {'installed: ' + str(mine[0]) if mine else 'not in ' + settings}")
+    if "hermes" in agents:
+        plug = os.path.join(hosts.hermes_home(), "plugins", "tokeneconomizer")
+        db = os.path.join(hosts.hermes_home(), "state.db")
+        where = ("at " + os.path.realpath(plug) if os.path.isdir(plug)
+                 else "not in " + os.path.dirname(plug))
+        print(f"hermes      plugin {where} (`hermes plugins enable tokeneconomizer` turns it "
+              f"on); state.db {'present' if os.path.exists(db) else 'not found'}")
     if "openclaw" in agents:
         _doctor_openclaw()
     ctx = _ctx(args)

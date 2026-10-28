@@ -6,8 +6,9 @@ here and nowhere else:
   * `calls`    -- `load_trajectory`: any agent's log as ordered `(name, args, result, ok)` calls;
                   `call_cwds`, `tool_usage`, `strip_rtk_prefix`;
   * `catalog`  -- the tool list a session loaded, from whichever source the agent publishes;
-  * `claude`, `codex`, `copilot`, `pi` -- each agent's own session file: usage, metadata,
-                  prompt-turns, and the conversions that let the readers above handle it.
+  * `claude`, `codex`, `copilot`, `pi`, `hermes` -- each agent's own session log: usage,
+                  metadata, prompt-turns, and the conversions that let the readers above
+                  handle it.
 
 Stdlib only.
 """
@@ -23,6 +24,8 @@ from .codex import (codex_capability_trace, codex_exec_calls, codex_prompt_count
 from .copilot import (copilot_event_calls, copilot_mcp_servers, copilot_prompt_count,
                       copilot_session_meta, copilot_session_usage, copilot_turns,
                       mcp_server_of)
+from .hermes import (hermes_ended, hermes_last_activity, hermes_prompt_count, hermes_result,
+                     hermes_session_to_claude, hermes_session_usage, hermes_split, hermes_tool)
 from .pi import (pi_active_branch, pi_json_reply, pi_prompt_count, pi_session_header,
                  pi_session_to_claude, pi_session_usage)
 
@@ -39,4 +42,6 @@ __all__ = [
     "copilot_session_usage", "copilot_turns", "mcp_server_of",
     "pi_active_branch", "pi_json_reply", "pi_prompt_count", "pi_session_header",
     "pi_session_to_claude", "pi_session_usage",
+    "hermes_ended", "hermes_last_activity", "hermes_prompt_count", "hermes_result",
+    "hermes_session_to_claude", "hermes_session_usage", "hermes_split", "hermes_tool",
 ]

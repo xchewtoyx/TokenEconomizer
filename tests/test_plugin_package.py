@@ -749,3 +749,243 @@ def test_codex_sees_no_claude_format_commands_folder():
     for manifest in (".claude-plugin/plugin.json", ".github/plugin/plugin.json"):
         with open(os.path.join(PLUGIN, manifest), encoding="utf-8") as fh:
             assert json.load(fh)["commands"] == "./slash-commands/"
+
+
+# ---- Hermes: a Python plugin loaded into Hermes' own process --------------------------------
+HERMES_SHIM = os.path.join(PLUGIN, "hermes", "__init__.py")
+
+
+def _load_hermes_shim(path=HERMES_SHIM):
+    """The shim as Hermes loads it: a package from a file location (plugins_loader.py)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        f"te_hermes_{abs(hash(path))}", path,
+        submodule_search_locations=[os.path.dirname(path)])
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _HermesCtx:
+    """The parts of Hermes' PluginContext the shim uses."""
+    def __init__(self, cwd, raise_cwd=False):
+        self.cwd, self.raise_cwd = cwd, raise_cwd
+        self.hooks, self.sections, self.commands, self.posted = {}, {}, {}, []
+
+    def session_cwd(self):
+        if self.raise_cwd:
+            raise RuntimeError("no session")
+        return self.cwd
+
+    def session_surface(self):
+        return "cli"
+
+    def post_message(self, text):
+        self.posted.append(text)
+
+    def register_hook(self, name, fn):
+        self.hooks[name] = fn
+
+    def register_system_prompt_section(self, sid, fn, position="after_memory"):
+        self.sections[sid] = fn
+
+    def register_command(self, name, fn, description="", args_hint=""):
+        self.commands[name] = fn
+
+
+def _yaml_list(path, key):
+    """The items of a top-level `key:` list in a plain YAML file (no YAML library here)."""
+    items, inside = [], False
+    for line in open(path, encoding="utf-8"):
+        if line.startswith(f"{key}:"):
+            inside = True
+        elif inside and line.startswith("  - "):
+            items.append(line[4:].strip())
+        elif inside and line.strip():
+            break
+    return items
+
+
+def test_the_hermes_manifest_names_the_hooks_the_shim_registers(tmp_path):
+    ctx = _HermesCtx(str(tmp_path))
+    _load_hermes_shim().register(ctx)
+    manifest = os.path.join(PLUGIN, "hermes", "plugin.yaml")
+    assert set(_yaml_list(manifest, "provides_hooks")) == set(ctx.hooks)
+    # Never `pre_tool_call`: Hermes fails closed when a pre-tool hook throws or times out.
+    assert "pre_tool_call" not in ctx.hooks and set(ctx.sections) == {"tokeneconomizer"}
+    assert set(ctx.commands) == {"te"}
+    text = open(manifest, encoding="utf-8").read()
+    assert re.search(r'^name: tokeneconomizer$', text, re.M)
+    version = re.search(r'^version: "([^"]+)"$', text, re.M).group(1)
+    assert version == _json(PLUGIN, ".claude-plugin", "plugin.json")["version"]
+
+
+def test_the_hermes_shim_is_stdlib_only_and_spawns_the_dispatcher():
+    for mod, level in _imports(HERMES_SHIM):
+        assert level == 0 and mod.split(".")[0] in sys.stdlib_module_names, mod
+    src = open(HERMES_SHIM, encoding="utf-8").read()
+    assert '_run("te-hook", ["--host", "hermes"]' in src
+
+
+def test_every_hermes_callback_fails_open(tmp_path, monkeypatch):
+    """A dispatcher that dies, answers garbage or a context that raises: every callback answers
+    Hermes' "no change" (None; "" for the section), and the tool result stays as it was."""
+    monkeypatch.setenv("TOKENECONOMIZER_HOME", str(tmp_path / "home"))
+    broken = tmp_path / "plugin"
+    (broken / "hermes").mkdir(parents=True)
+    shutil.copy(HERMES_SHIM, broken / "hermes" / "__init__.py")
+    (broken / "scripts").mkdir()
+    hook = broken / "scripts" / "te-hook"
+    hook.write_text("#!/bin/sh\necho 'not json'\nexit 3\n")
+    hook.chmod(0o755)
+    for raise_cwd in (False, True):
+        ctx = _HermesCtx(str(tmp_path), raise_cwd=raise_cwd)
+        _load_hermes_shim(str(broken / "hermes" / "__init__.py")).register(ctx)
+        assert ctx.sections["tokeneconomizer"]({"session_id": "s", "platform": "cli"}) == ""
+        kw = {"session_id": "s", "turn_id": "t", "platform": "cli"}
+        assert ctx.hooks["on_session_start"](**kw) is None
+        assert ctx.hooks["subagent_start"](child_session_id="c") is None
+        assert ctx.hooks["pre_llm_call"](**kw, user_message="hi", is_first_turn=True) is None
+        assert ctx.hooks["transform_tool_result"](
+            tool_name="terminal", args={"command": "ls"}, result='{"exit_code": 1}',
+            status="error", error_message="exit 1", **kw) is None
+        assert ctx.hooks["on_session_end"](completed=True, interrupted=False, **kw) is None
+        assert ctx.hooks["on_session_finalize"](session_id="s", platform="cli") is None
+        assert isinstance(ctx.commands["te"]("status", session_id="s"), str)
+    assert "hermes" in (tmp_path / "home" / "errors.log").read_text()   # the raise was logged
+
+
+def test_the_hermes_shim_drives_the_dispatcher_end_to_end(tmp_path, monkeypatch):
+    """Through the real launcher: a session start pins the session to the repository, a tool
+    result passes through unchanged while the guard has nothing to say, and `/te` answers."""
+    for k, v in _hook_env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    work = tmp_path / "work"
+    work.mkdir()
+    ctx = _HermesCtx(str(work))
+    _load_hermes_shim().register(ctx)
+    assert ctx.sections["tokeneconomizer"]({"session_id": "s1", "platform": "cli",
+                                            "cwd": str(work)}) == ""
+    homes = list((tmp_path / "home").rglob("sessions/s1.json"))
+    assert len(homes) == 1
+    rec = json.loads(homes[0].read_text())
+    assert rec["host"] == "hermes" and rec["transcript"] == \
+        str(tmp_path / "hermes" / "state.db") + "#s1"
+    assert ctx.hooks["transform_tool_result"](
+        tool_name="terminal", args={"command": "ls"}, session_id="s1", turn_id="t1",
+        result='{"output": "a", "exit_code": 0, "error": null}', status="ok") is None
+    # A subagent's events never reach the dispatcher.
+    ctx.hooks["subagent_start"](child_session_id="kid")
+    assert ctx.sections["tokeneconomizer"]({"session_id": "kid", "platform": "cli"}) == ""
+    assert not list((tmp_path / "home").rglob("sessions/kid.json"))
+    assert "TokenEconomizer" in ctx.commands["te"]("status", session_id="s1")
+
+
+def test_a_hermes_turn_of_many_calls_is_one_guarded_turn(tmp_path, monkeypatch):
+    """Through the shim and the real launcher: a turn's calls fold into one guard, so a stuck
+    turn reaches the redirect (appended to the result the model reads), a repeated
+    `pre_llm_call` for the same turn does not reopen it, and `on_session_end` closes it."""
+    from tests.test_live_hooks import _stuck
+    for k, v in _hook_env(tmp_path).items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    work = tmp_path / "work"
+    work.mkdir()
+    ctx = _HermesCtx(str(work))
+    _load_hermes_shim().register(ctx)
+    h = ctx.hooks
+    assert ctx.sections["tokeneconomizer"]({"session_id": "s", "platform": "cli",
+                                            "cwd": str(work)}) == ""
+
+    def turn(tid, calls):
+        out = []
+        h["pre_llm_call"](session_id="s", turn_id=tid, is_first_turn=False)
+        for k, (name, args, result) in enumerate(calls):
+            if k == 3:                                   # a second call for the same turn
+                h["pre_llm_call"](session_id="s", turn_id=tid, is_first_turn=False)
+            failed = '"exit_code": 1' in result
+            out.append(h["transform_tool_result"](
+                tool_name=name, args=args, result=result, session_id="s", turn_id=tid,
+                status="error" if failed else "ok", error_message="exit 1" if failed else None))
+        h["on_session_end"](session_id="s", turn_id=tid, completed=True, interrupted=False,
+                            failed=False)
+        return out
+
+    for k in range(5):
+        turn(f"g{k}", [("read_file", {"path": "/r/a.py"}, '{"content": "ok"}')] * 8)
+    stuck = _stuck("hermes")
+    outs = turn("stuck", stuck)
+    redirected = [k for k, o in enumerate(outs) if o and "Process check (automated)" in o]
+    assert redirected and outs[redirected[0]].startswith(stuck[redirected[0]][2])
+    (rec,) = (tmp_path / "home").rglob("sessions/s.json")
+    turns = json.loads(rec.read_text())["turns"]
+    assert [(t["turn_key"], t["tool_calls"]) for t in turns] == [
+        (f"g{k}", 8) for k in range(5)] + [("stuck", len(stuck))]
+    assert turns[-1]["nudges"] == 1
+
+
+def test_the_hermes_shim_logs_a_launcher_that_is_missing_or_too_slow(tmp_path, monkeypatch):
+    monkeypatch.setenv("TOKENECONOMIZER_HOME", str(tmp_path / "home"))
+    shim = _load_hermes_shim()
+    monkeypatch.setattr(shim, "_scripts", lambda: None)
+    assert shim._run("te-hook", ["--host", "hermes"], "{}", 1) == ""
+    slow = tmp_path / "scripts"
+    slow.mkdir()
+    (slow / "te-hook").write_text("#!/bin/sh\nsleep 5\n")
+    (slow / "te-hook").chmod(0o755)
+    monkeypatch.setattr(shim, "_scripts", lambda: str(slow))
+    assert shim._run("te-hook", ["--host", "hermes"], "{}", 0.2) == ""
+    log = (tmp_path / "home" / "errors.log").read_text()
+    assert "no launchers found" in log and "no answer within 0.2 s" in log
+
+
+def test_a_finalized_hermes_subagent_is_forgotten(tmp_path, monkeypatch):
+    monkeypatch.setenv("TE_DISABLE", "1")                # no dispatcher needed here
+    ctx = _HermesCtx(str(tmp_path))
+    shim = _load_hermes_shim()
+    calls = []
+    monkeypatch.setattr(shim, "_hook", lambda p, *a: calls.append(p) or {})
+    shim.register(ctx)
+    ctx.hooks["subagent_start"](child_session_id="kid")
+    ctx.hooks["on_session_finalize"](session_id="kid", platform="subagent")
+    assert calls == []                                   # no SessionEnd for a subagent
+    ctx.hooks["pre_llm_call"](session_id="kid", turn_id="t")
+    assert [c["session_id"] for c in calls] == ["kid"]   # the id is no longer held
+
+
+def test_a_hermes_session_end_waits_for_a_tool_result_in_flight(tmp_path, monkeypatch):
+    import threading
+    import time
+    ctx = _HermesCtx(str(tmp_path))
+    shim = _load_hermes_shim()
+    order, started = [], threading.Event()
+
+    def fake_hook(p, *a):
+        if p["hook_event_name"] == "PostToolUse":
+            started.set()
+            time.sleep(0.3)
+        order.append(p["hook_event_name"])
+        return {}
+    monkeypatch.setattr(shim, "_hook", fake_hook)
+    shim.register(ctx)
+    t = threading.Thread(target=ctx.hooks["transform_tool_result"], kwargs=dict(
+        tool_name="terminal", args={"command": "ls"}, result="{}", session_id="s",
+        turn_id="t", status="ok"))
+    t.start()
+    started.wait(5)
+    ctx.hooks["on_session_finalize"](session_id="s", platform="cli")
+    t.join()
+    assert order == ["PostToolUse", "SessionEnd"]
+
+
+def test_the_hermes_bundle_is_a_plugin_directory_on_its_own(tmp_path):
+    out = tmp_path / "market"
+    subprocess.run([sys.executable, os.path.join(REPO, "scripts", "build_plugin.py"),
+                    "--out", str(out)], check=True, capture_output=True)
+    bundle = out / "hermes" / "tokeneconomizer"
+    assert (bundle / "plugin.yaml").exists() and (bundle / "__init__.py").exists()
+    assert os.access(bundle / "scripts" / "te-hook", os.X_OK)
+    assert (bundle / "lib" / "tokeneconomizer" / "plugin" / "hook.py").exists()
+    mod = _load_hermes_shim(str(bundle / "__init__.py"))
+    assert mod._scripts() == str(bundle / "scripts")

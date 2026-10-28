@@ -25,6 +25,10 @@ so no extra API key is needed and the call is billed where the session is:
     skills, prompt templates, context files, MCP servers or saved session. With no `paid_model`
     it runs on the person's own default provider and model, under whatever login Pi holds for
     it (a subscription signed in with `/login`, or an API key).
+  * Hermes: `hermes -z` (one-shot: prints only the reply) with `--ignore-rules` (no AGENTS.md,
+    memory or preloaded skills) and `--usage-file`, whose JSON report carries the run's tokens.
+    Hermes has no "no tools" switch; `-t context_engine` enables only the context engine's own
+    toolset, which the built-in engine leaves empty (unverified on a running Hermes).
   * OpenClaw: `openclaw agent exec --json` with every tool denied, in a neutral cwd and a
     throwaway state directory, on the person's configured default model unless `paid_model`.
 
@@ -269,6 +273,33 @@ def copilot_call(prompt, model="", cli="copilot", timeout=TIMEOUT_S):
     return text, eff
 
 
+def hermes_call(prompt, model="", cli="hermes", timeout=TIMEOUT_S):
+    with tempfile.TemporaryDirectory(prefix="te-side-") as cwd:
+        usage_file = os.path.join(cwd, "usage.json")
+        # `--oneshot=` keeps a prompt that starts with "-" from reading as a flag.
+        cmd = [cli, f"--oneshot={prompt}", "--ignore-rules", "-t", "context_engine",
+               "--usage-file", usage_file] + (["-m", model] if model else [])
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                             env=_env(), cwd=cwd, stdin=subprocess.DEVNULL)
+        try:
+            with open(usage_file, encoding="utf-8") as fh:
+                report = json.load(fh)
+        except (OSError, ValueError):
+            report = None
+    text = (out.stdout or "").strip()
+    if not text:
+        _no_reply("hermes", out)
+    eff = None
+    if isinstance(report, dict) and report.get("input_tokens") is not None:
+        eff, _ = accounting.effective({
+            "input_tokens": int(report.get("input_tokens") or 0),
+            "cache_read_input_tokens": int(report.get("cache_read_tokens") or 0),
+            "cache_creation_input_tokens": int(report.get("cache_write_tokens") or 0),
+            "output_tokens": int(report.get("output_tokens") or 0),
+            "model": report.get("model") or model or "hermes"})
+    return text, eff
+
+
 # Every tool denied, for one run; the person's providers and logins still apply.
 OPENCLAW_NO_TOOLS = json.dumps({"tools": {"deny": ["*"]}})
 
@@ -341,6 +372,8 @@ def runner_for(host_name, config):
         return lambda prompt, _m="agent": codex_call(prompt, model=model)
     if host_name == "copilot":
         return lambda prompt, _m="agent": copilot_call(prompt, model=model)
+    if host_name == "hermes":
+        return lambda prompt, _m="agent": hermes_call(prompt, model=model)
     if host_name == "openclaw":
         return lambda prompt, _m="agent": openclaw_call(prompt, model=model)
     return lambda prompt, _m="agent": claude_call(prompt, model=model or "haiku")

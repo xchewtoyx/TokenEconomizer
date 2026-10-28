@@ -7,7 +7,8 @@ behaviour of each agent are in [`docs/PLUGIN.md`](../docs/PLUGIN.md).
 
 - [Before you start](#before-you-start)
 - Install and use it on [Claude Code](#claude-code) · [Codex](#codex) ·
-  [Copilot CLI](#copilot-cli) · [Pi](#pi) · [OpenClaw](#openclaw)
+  [Copilot CLI](#copilot-cli) · [Pi](#pi) · [Hermes Agent](#hermes-agent-unverified) ·
+  [OpenClaw](#openclaw)
 - [What to expect](#what-to-expect) · [Commands](#commands) · [Settings](#settings)
 - [Repository map](#repository-map) · [Using with rtk](#using-with-rtk) ·
   [Model calls and API keys](#model-calls-and-api-keys) · [Troubleshooting](#troubleshooting)
@@ -284,6 +285,51 @@ after the loop guard's redirect gets a notice: press **Esc** to abort it, or Ctr
 
 **Uninstall.** `pi remove git:github.com/microsoft/TokenEconomizer` (the source you installed
 from); `pi config` turns it off without removing it. Optional: `rm -rf ~/.tokeneconomizer`.
+
+## Hermes Agent (unverified)
+
+This port was written from Hermes' source (`docs/ports/HERMES.md`) and has not yet been run on a
+real Hermes. Expect rough edges; [`docs/PLUGIN.md`](../docs/PLUGIN.md) §3 lists what is still
+to be checked. Tool pruning does not apply yet.
+
+**1. Install.** Hermes loads a plugin directory from `$HERMES_HOME/plugins/` (`~/.hermes`, or
+`~/.hermes/profiles/<name>` for a named profile; each profile installs and enables plugins on its
+own). Either link it from your clone, which `git pull` then updates:
+
+```bash
+ln -s /path/to/TokenEconomizer/plugin/hermes ~/.hermes/plugins/tokeneconomizer
+```
+
+or copy the self-contained build, which carries its launchers and the core inside it:
+
+```bash
+python scripts/build_plugin.py --out /tmp/te-build
+cp -r /tmp/te-build/hermes/tokeneconomizer ~/.hermes/plugins/
+```
+
+Then turn it on and start a new session:
+
+```bash
+hermes plugins enable tokeneconomizer
+```
+
+`hermes plugins install xchewtoyx/TokenEconomizer/plugin/hermes` does not work: Hermes installs
+only that folder, without the launchers and the core it needs.
+
+**2. Check it.** In a session, type `/te status`. The commands are `/te status`,
+`/te microskills`, `/te config …` and `/te repos`; from a terminal, inside the repository,
+`~/.tokeneconomizer/bin/te --host hermes <command>`. Learned facts go into a section of the
+session's system prompt, which Hermes builds once per session. A turn that is still stuck after
+the loop guard's redirect gets a notice: send `/stop` (in the terminal, Ctrl+C also interrupts
+it).
+
+**In a container** (the `nousresearch/hermes-agent` image): the gateway and the terminal tool
+run with different home directories, so set `TOKENECONOMIZER_HOME` (for example
+`/opt/data/tokeneconomizer`) in the gateway's environment, or the plugin's state and `te` in the
+terminal end up in two places. The plugin runs the `python3` on `PATH`.
+
+**Uninstall.** `hermes plugins disable tokeneconomizer`, then remove
+`~/.hermes/plugins/tokeneconomizer`. Optional: `rm -rf ~/.tokeneconomizer`.
 
 ## OpenClaw
 
@@ -591,7 +637,8 @@ These calls run through **your own agent's CLI**: `claude -p`; `codex exec`; `co
 every tool removed; and `pi -p`, with nothing loaded but the model. So they use whatever your
 sessions already use (a Claude subscription or Anthropic API key, your Codex login or OpenAI key,
 Copilot's subscription, or the provider and login Pi is set up with), are billed there, and are
-shown in `status`. Copilot with BYOK is the exception; see [Copilot CLI](#copilot-cli).
+shown in `status`. Copilot with BYOK is the exception; see [Copilot CLI](#copilot-cli). On
+Hermes they run as `hermes -z` on your configured provider and model.
 
 A call that gets no reply leaves a line in `~/.tokeneconomizer/errors.log`. If the CLI answers
 that it is not signed in, that agent's calls are also paused (the loop guard then redirects only

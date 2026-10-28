@@ -232,3 +232,74 @@ def test_a_pi_session_counts_the_prompts_on_its_active_branch(tmp_path):
         msg("x", "b", "user"), msg("y", "x", "assistant"),        # abandoned
         msg("c", "b", "user"), msg("d", "c", "toolResult"), msg("e", "d", "assistant")])
     assert trace.pi_prompt_count(p) == 2
+
+
+# ---- Hermes: sessions in a SQLite state.db ---------------------------------------------------
+def _hermes_db(tmp_path, **extra):
+    from fixtures.hermes import hermes_state_db, terminal_result, tool_call, trap_messages
+    msgs = trap_messages("/w/repo", 0)
+    # A compaction in place replaced the first prompt and its calls; an Undo removed a call.
+    for m in msgs[:3]:
+        m.update(active=0, compacted=1)
+    msgs.insert(3, {"role": "user", "content": "[summary of earlier turns]",
+                    "_compressed_summary": 1})
+    msgs += [{"role": "user", "content": "now the docs"},
+             {"role": "assistant", "content": "", "active": 0,
+              "tool_calls": [tool_call("undone", "terminal", {"command": "rm -rf docs"})]},
+             {"role": "tool", "content": terminal_result("", 0), "tool_call_id": "undone",
+              "active": 0}]
+    return hermes_state_db(str(tmp_path / "state.db"), dict({
+        "id": "h1", "cwd": "/w/repo", "model": "anthropic/claude-haiku-4.5",
+        "input_tokens": 30, "output_tokens": 150, "cache_read_tokens": 3000,
+        "cache_write_tokens": 300, "api_call_count": 4, "estimated_cost_usd": 0.01,
+        "messages": msgs}, **extra))
+
+
+def test_a_hermes_session_reads_compacted_rows_and_skips_undone_ones(tmp_path):
+    tp = _hermes_db(tmp_path)
+    out = str(tmp_path / "trace.jsonl")
+    assert trace.hermes_session_to_claude(tp, out) == 3
+    traj = trace.load_trajectory(out)
+    assert [(n, a.get("command") or a.get("path"), ok) for n, a, _, ok in traj] == [
+        ("edit", "/w/repo/pkg/mod0.py", True), ("bash", "pytest -q tests/test_a.py", False),
+        ("bash", "python -m pytest -q tests/test_a.py", True)]
+    assert "command not found" in traj[1][2] and '"exit_code"' not in traj[1][2]
+    assert "rm -rf docs" not in open(out).read()
+    assert trace.call_cwds(out) == ["/w/repo"] * 3
+    assert trace.hermes_session_to_claude(tp.replace("#h1", "#nope"), out) is None
+
+
+def test_a_hermes_session_counts_its_live_prompts_and_maps_its_usage(tmp_path):
+    tp = _hermes_db(tmp_path, actual_cost_usd=0.02)
+    assert trace.hermes_prompt_count(tp) == 1          # "now the docs"; not the summary
+    u = trace.hermes_session_usage(tp)
+    assert (u["input_tokens"], u["cache_read_input_tokens"], u["cache_creation_input_tokens"],
+            u["output_tokens"], u["requests"]) == (30, 3000, 300, 150, 4)
+    assert u["cost_usd_vendor"] == 0.02 and u["model"] == "anthropic/claude-haiku-4.5"
+    assert trace.hermes_prompt_count(str(tmp_path / "missing.db#h1")) is None
+
+
+def test_a_hermes_result_fails_on_its_exit_code_or_its_error():
+    from fixtures.hermes import terminal_result
+    assert trace.hermes_result(terminal_result("boom", 2, "exit 2")) == ("boom\nexit 2", 2, True)
+    assert trace.hermes_result(terminal_result("ok", 0)) == ("ok", 0, False)
+    assert trace.hermes_result('{"success": true}')[2] is False       # no exit code: not failed
+    assert trace.hermes_result('{"error": "no such file"}')[2] is True
+    assert trace.hermes_result("plain text") == ("plain text", None, False)
+    assert trace.hermes_tool("patch", {"mode": "patch", "patch": "*** Update File: a/b.py\n"}) \
+        == ("edit", {"path": "a/b.py"})
+
+
+def test_a_hermes_database_is_read_while_hermes_holds_it_open(tmp_path):
+    """Hermes keeps state.db open in WAL mode; a read-only reader still sees committed rows."""
+    import sqlite3
+    tp = _hermes_db(tmp_path)
+    writer = sqlite3.connect(str(tmp_path / "state.db"))
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("INSERT INTO messages (session_id, role, content, timestamp) "
+                       "VALUES ('h1', 'user', 'uncommitted', 0)")
+        assert trace.hermes_prompt_count(tp) == 1
+    finally:
+        writer.rollback()
+        writer.close()

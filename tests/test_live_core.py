@@ -248,6 +248,8 @@ def test_host_detection():
     assert hosts.detect({"session_id": "s", "transcript_path": "/h/.claude/projects/x/s.jsonl"},
                         copilot_env).name == "claude"
     assert hosts.detect({"session_id": "s"}, {}).name == "claude"
+    assert hosts.detect({"transcript_path": "/h/.hermes/state.db#20261028_1"}).name == "hermes"
+    assert hosts.detect({}, hint="hermes").name == "hermes"
 
 
 def test_the_te_command_defaults_to_the_agent_whose_shell_runs_it():
@@ -464,6 +466,45 @@ def test_the_pi_host_reads_what_the_extension_sends():
     assert hosts.detect({"turn_id": "t"}, hint="pi").name == "pi"
 
 
+def test_the_hermes_host_reads_what_the_shim_sends():
+    from fixtures.hermes import terminal_result
+    h = hosts.HOSTS["hermes"]()
+    name, args, text, code = h.tool_call({
+        "tool_name": "terminal", "tool_input": {"command": "go test", "timeout": 60},
+        "tool_response": terminal_result("FAIL\tpkg", 1, "exit 1"), "error": "exit 1"})
+    assert (name, args, code) == ("bash", {"command": "go test"}, 1) and "FAIL" in text
+    name, args, text, code = h.tool_call({"tool_name": "read_file",
+                                          "tool_input": {"path": "a.py", "offset": 1},
+                                          "tool_response": '{"content": "assert x"}'})
+    assert (name, args, code) == ("view", {"path": "a.py"}, None) and "assert x" in text
+    assert h.tool_call({"tool_name": "mcp__gh__issues", "tool_input": {"q": 1},
+                        "tool_response": "ok"})[:2] == ("mcp__gh__issues", {"q": 1})
+    assert h.headless({"HERMES_SINGLE_QUERY_SESSION": "1", "TE_HERMES_SURFACE": "cli"})
+    assert h.headless({"TE_HERMES_SURFACE": "cron"})
+    assert not h.headless({"TE_HERMES_SURFACE": "telegram"})   # a chat: /stop works there
+    assert h.context("PostToolUse", "x") == {"additionalContext": "x"}
+
+
+def test_a_hermes_session_with_no_end_is_folded_once_it_goes_quiet(tmp_path):
+    """A `state.db#<id>` transcript never stats; its liveness is the session's newest message
+    (or its `ended_at`), not the database file's mtime, which every session writes."""
+    import time
+    from fixtures.hermes import hermes_state_db, trap_messages
+    from tokeneconomizer.plugin import fold
+    from tokeneconomizer.plugin.context import LiveContext
+    env = {"TOKENECONOMIZER_HOME": str(tmp_path / "te"), "GIT_CEILING_DIRECTORIES": str(tmp_path)}
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    db, now = str(tmp_path / "state.db"), time.time()
+    ctx = LiveContext.build(hosts.HOSTS["hermes"](), str(repo), env=env)
+    for sid, last in (("old", now - 3600), ("recent", now - 60), ("gone", None)):
+        msgs = [dict(m, timestamp=last) for m in trap_messages(str(repo), 0)] if last else []
+        tp = (hermes_state_db(db, {"id": sid, "cwd": str(repo), "started_at": now - 7200,
+                                   "messages": msgs}) if last else f"{db}#{sid}")
+        ctx.store.write(f"sessions/{sid}.json", {"session_id": sid, "started": now - 7200,
+                                                 "transcript": tp})
+    assert fold.pending_sessions(ctx, now=now) == ["old"]
+    assert ctx.host.last_activity(f"{db}#recent") == pytest.approx(now - 60)
 def test_the_openclaw_host_reads_what_the_shim_sends():
     h = hosts.HOSTS["openclaw"]()
     # A failed exec: PostToolUseFailure with the result in Pi's shape, the exit code from
@@ -890,6 +931,33 @@ def test_a_pi_side_call_is_a_bare_run_on_the_persons_own_pi(monkeypatch):
     calls.clear()
     sidecall.pi_call("propose facts", model="openrouter/anthropic/claude-haiku-4.5")
     assert calls[-1][0][-4:-2] == ["--model", "openrouter/anthropic/claude-haiku-4.5"]
+
+
+@pytest.mark.real_sidecalls
+def test_a_hermes_side_call_is_a_one_shot_run_priced_from_its_usage_report(monkeypatch):
+    import subprocess
+    from tokeneconomizer.plugin import sidecall
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen.update(cmd=cmd, kw=kw)
+        path = cmd[cmd.index("--usage-file") + 1]
+        with open(path, "w") as fh:
+            json.dump({"input_tokens": 700, "output_tokens": 40, "cache_read_tokens": 0,
+                       "cache_write_tokens": 0, "api_calls": 1,
+                       "model": "anthropic/claude-haiku-4.5"}, fh)
+        return subprocess.CompletedProcess(cmd, 0, stdout="- use python -m pytest\n", stderr="")
+
+    monkeypatch.setattr(sidecall.subprocess, "run", fake_run)
+    text, eff = sidecall.hermes_call("propose facts", model="anthropic/claude-haiku-4.5")
+    assert text == "- use python -m pytest" and eff and eff > 0
+    cmd = seen["cmd"]
+    assert cmd[:2] == ["hermes", "--oneshot=propose facts"] and "--ignore-rules" in cmd
+    assert cmd[cmd.index("-t") + 1] == "context_engine" and cmd[-2:] == [
+        "-m", "anthropic/claude-haiku-4.5"]
+    assert seen["kw"]["env"]["TE_SIDECALL"] == "1"     # its own hooks must not recurse
+    cfg = live_config.LiveConfig()
+    assert sidecall.runner_for("hermes", cfg).__code__.co_names.count("hermes_call") == 1
 
 
 def test_a_copilot_notice_is_a_progress_line_before_the_hook_output():

@@ -19,6 +19,7 @@ repository of its own, or zip for `claude --plugin-url`):
 
     <out>/.claude-plugin/marketplace.json
     <out>/tokeneconomizer/              the plugin, with lib/tokeneconomizer copied in
+    <out>/hermes/tokeneconomizer/       the Hermes plugin, self-contained (scripts/, lib/)
 """
 import argparse
 import json
@@ -51,6 +52,15 @@ def build(out):
               encoding="utf-8") as fh:
         json.dump(market, fh, indent=2)
         fh.write("\n")
+    # Hermes loads a plugin directory with its manifest at the top; this one carries the
+    # launchers and the core inside it, to copy as `$HERMES_HOME/plugins/tokeneconomizer`.
+    hermes_out = os.path.join(out, "hermes", "tokeneconomizer")
+    if os.path.exists(hermes_out):
+        shutil.rmtree(hermes_out)
+    shutil.copytree(os.path.join(plugin_out, "hermes"), hermes_out, ignore=IGNORE)
+    for sub in ("scripts", "lib"):
+        shutil.copytree(os.path.join(plugin_out, sub), os.path.join(hermes_out, sub),
+                        ignore=IGNORE)
     return plugin_out
 
 
