@@ -290,6 +290,17 @@ def test_a_hermes_result_fails_on_its_exit_code_or_its_error():
         == ("edit", {"path": "a/b.py"})
 
 
+def test_a_hermes_database_path_may_contain_uri_punctuation(tmp_path):
+    """`#` and `?` in the profile path are URI syntax; the reader still opens the file."""
+    from fixtures.hermes import hermes_state_db
+    home = tmp_path / "dev #1?"
+    home.mkdir()
+    tp = hermes_state_db(str(home / "state.db"), {"id": "h1", "cwd": "/w/repo",
+                                                  "messages": [{"role": "user", "content": "hi"}]})
+    assert "#" in tp and "?" in tp
+    assert trace.hermes_prompt_count(tp) == 1
+
+
 def test_a_hermes_database_is_read_while_hermes_holds_it_open(tmp_path):
     """Hermes keeps state.db open in WAL mode; a read-only reader still sees committed rows."""
     import sqlite3

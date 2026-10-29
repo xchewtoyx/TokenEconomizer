@@ -75,7 +75,7 @@ Fold-time needs, per host:
 | Tool result plus a nudge | `transform_tool_result` (returning a string replaces the result) | `after_tool_call` (observe only); nudge through agent tool-result middleware |
 | Turn end | `on_session_end` (fires **after every turn**) | `agent_end` |
 | Session end | `on_session_finalize` | `session_end` (2 s shared drain on shutdown) |
-| Repository cwd | `ctx.session_cwd()`; `sessions.cwd` / `git_repo_root` in `state.db` | `before_prompt_build` ctx `workspaceDir`; session header `cwd`; exec `details.cwd` |
+| Repository cwd | v0.21.5: `agent.runtime_cwd` session pin, else `sessions.cwd`, else the process cwd. Later Hermes: `ctx.session_cwd()` | `before_prompt_build` ctx `workspaceDir`; session header `cwd`; exec `details.cwd` |
 | Finished log | SQLite `~/.hermes[/profiles/<p>]/state.db` (stdlib `sqlite3` reads it) | SQLite with zstd for events ≥1 KiB (**unreadable** without zstd before Python 3.14) |
 | Exit code | terminal result JSON `{"output","exit_code","error"}` | exec `details.exitCode` (whether the hook sees it is unverified) |
 | Tool pruning lever | `agent.disabled_toolsets` (per profile, YAML) or `llm_request` middleware | `before_prompt_build` → `toolsAllow` (per turn, no config edit) |

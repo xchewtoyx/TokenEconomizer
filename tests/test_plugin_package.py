@@ -794,6 +794,23 @@ def _load_hermes_shim(path=HERMES_SHIM):
     return mod
 
 
+class _HermesCtxV0215:
+    """PluginContext as hermes-agent v0.21.5 (`f97608f`) exposes it to `register()`.
+
+    `session_cwd`, `session_surface` and `post_message` are not on that release."""
+    def __init__(self):
+        self.hooks, self.sections, self.commands = {}, {}, {}
+
+    def register_hook(self, name, fn):
+        self.hooks[name] = fn
+
+    def register_system_prompt_section(self, sid, fn, position="after_memory"):
+        self.sections[sid] = fn
+
+    def register_command(self, name, fn, description="", args_hint=""):
+        self.commands[name] = fn
+
+
 class _HermesCtx:
     """The parts of Hermes' PluginContext the shim uses."""
     def __init__(self, cwd, raise_cwd=False):
@@ -881,6 +898,99 @@ def test_every_hermes_callback_fails_open(tmp_path, monkeypatch):
         assert ctx.hooks["on_session_finalize"](session_id="s", platform="cli") is None
         assert isinstance(ctx.commands["te"]("status", session_id="s"), str)
     assert "hermes" in (tmp_path / "home" / "errors.log").read_text()   # the raise was logged
+
+
+def test_a_v0215_context_without_session_cwd_injects_and_runs_every_hook(tmp_path, monkeypatch):
+    """hermes-agent v0.21.5 has no `session_cwd`. Cron pins the directory on
+    `agent.runtime_cwd` and does not chdir; the session row and the process cwd are the
+    fallbacks. `microskills=on` is stored as `envfacts+distiller`, and facts render."""
+    import types
+    from tokeneconomizer.plugin.config import load_config
+    from tokeneconomizer.plugin.paths import repo_identity, repo_state_dir
+    from tokeneconomizer.plugin.store import Store
+    from fixtures.hermes import hermes_state_db
+
+    env = _hook_env(tmp_path)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("TE_MICROSKILLS", raising=False)
+    home = tmp_path / "hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    ident = repo_identity(str(repo), env)
+    st = Store(repo_state_dir(ident, "hermes", env))
+    cfg_dir = os.path.dirname(st.base)
+    os.makedirs(cfg_dir, exist_ok=True)
+    with open(os.path.join(cfg_dir, "config.json"), "w", encoding="utf-8") as fh:
+        json.dump({"microskills": "on"}, fh)
+    assert load_config(str(tmp_path / "home"), repo_dir=cfg_dir, env=env).microskills \
+        == "envfacts+distiller"
+    fact = "Facts:\n- the suite is `python -m pytest`"
+    st.write("injection.json", {"rendered": fact, "rendered_ids": ["a"]})
+
+    held = {"cwd": str(repo)}
+    runtime = types.ModuleType("agent.runtime_cwd")
+    runtime.scoped_session_cwd = lambda: held["cwd"]
+    saved = {name: sys.modules.get(name) for name in ("agent", "agent.runtime_cwd")}
+    sys.modules["agent"] = types.ModuleType("agent")
+    sys.modules["agent.runtime_cwd"] = runtime
+    try:
+        ctx = _HermesCtxV0215()
+        assert not hasattr(ctx, "session_cwd")
+        _load_hermes_shim().register(ctx)
+        section = ctx.sections["tokeneconomizer"]
+        assert fact in section({"session_id": "s-runtime", "platform": "cron"})
+        kw = {"session_id": "s-runtime", "turn_id": "t1", "platform": "cron"}
+        for name in ("on_session_start", "pre_llm_call", "transform_tool_result",
+                     "on_session_end", "on_session_finalize"):
+            assert name in ctx.hooks
+        assert ctx.hooks["on_session_start"](**kw) is None
+        assert ctx.hooks["subagent_start"](child_session_id="kid") is None
+        assert ctx.hooks["pre_llm_call"](**kw, user_message="hi", is_first_turn=True) is None
+        assert ctx.hooks["transform_tool_result"](
+            tool_name="terminal", args={"command": "ls"}, result="ok", status="ok", **kw) is None
+        assert ctx.hooks["on_session_end"](
+            completed=True, interrupted=False, failed=False, **kw) is None
+        assert ctx.hooks["on_session_finalize"](
+            session_id="s-runtime", platform="cron", reason="end") is None
+        assert "TokenEconomizer" in ctx.commands["te"]("status", session_id="s-runtime")
+
+        held["cwd"] = ""
+        hermes_state_db(str(home / "state.db"), {"id": "s-record", "cwd": str(repo)})
+        assert fact in section({"session_id": "s-record", "platform": "cli"})
+
+        monkeypatch.chdir(repo)
+        assert fact in section({"session_id": "s-process", "platform": "cli"})
+    finally:
+        for name, mod in saved.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+    log = tmp_path / "home" / "errors.log"
+    assert not log.exists(), log.read_text() if log.exists() else ""
+
+
+def test_a_hermes_cwd_keeps_a_trailing_space_and_a_punctuated_home(tmp_path, monkeypatch):
+    """A checkout whose name ends in a space stays that path. A profile home whose
+    path contains `#` or `?` still yields `sessions.cwd`."""
+    from fixtures.hermes import hermes_state_db
+    shim = _load_hermes_shim()
+    spaced = str(tmp_path / "project ")
+    assert shim._usable_cwd(spaced) == spaced
+    assert shim._usable_cwd("  auto  ") == "" and shim._usable_cwd("  ") == ""
+    home = tmp_path / "dev #1?"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    hermes_state_db(str(home / "state.db"), {"id": "s", "cwd": spaced})
+    assert shim._recorded_cwd("s") == spaced
 
 
 def test_the_hermes_shim_drives_the_dispatcher_end_to_end(tmp_path, monkeypatch):
