@@ -129,10 +129,13 @@ _CWD_SKIP = {"", ".", "./", "auto", "cwd"}
 
 
 def _usable_cwd(value):
+    """A directory path, or "" when it is empty or a Hermes sentinel.
+
+    The sentinel check uses a trimmed copy. The path is returned unchanged: a
+    checkout's name may end in a space."""
     if not isinstance(value, str):
         return ""
-    value = value.strip()
-    return "" if value.lower() in _CWD_SKIP else value
+    return "" if value.strip().lower() in _CWD_SKIP else value
 
 
 def _context_cwd(ctx):
@@ -176,7 +179,9 @@ def _recorded_cwd(sid):
         return ""
     try:
         import sqlite3
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
+        from urllib.parse import quote
+        # `#` and `?` in the profile path are URI syntax unless percent-encoded.
+        con = sqlite3.connect("file:" + quote(db, safe="/") + "?mode=ro", uri=True, timeout=1.0)
         try:
             row = con.execute("SELECT cwd FROM sessions WHERE id = ?", (sid,)).fetchone()
         finally:

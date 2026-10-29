@@ -978,6 +978,21 @@ def test_a_v0215_context_without_session_cwd_injects_and_runs_every_hook(tmp_pat
     assert not log.exists(), log.read_text() if log.exists() else ""
 
 
+def test_a_hermes_cwd_keeps_a_trailing_space_and_a_punctuated_home(tmp_path, monkeypatch):
+    """A checkout whose name ends in a space stays that path. A profile home whose
+    path contains `#` or `?` still yields `sessions.cwd`."""
+    from fixtures.hermes import hermes_state_db
+    shim = _load_hermes_shim()
+    spaced = str(tmp_path / "project ")
+    assert shim._usable_cwd(spaced) == spaced
+    assert shim._usable_cwd("  auto  ") == "" and shim._usable_cwd("  ") == ""
+    home = tmp_path / "dev #1?"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    hermes_state_db(str(home / "state.db"), {"id": "s", "cwd": spaced})
+    assert shim._recorded_cwd("s") == spaced
+
+
 def test_the_hermes_shim_drives_the_dispatcher_end_to_end(tmp_path, monkeypatch):
     """Through the real launcher: a session start pins the session to the repository, a tool
     result passes through unchanged while the guard has nothing to say, and `/te` answers."""

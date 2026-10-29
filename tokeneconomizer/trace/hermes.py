@@ -32,7 +32,9 @@ def hermes_split(transcript_path):
 
 def _connect(db):
     # Read-only on a WAL database needs the -wal/-shm files the writer keeps (or a writable dir).
-    return sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2.0)
+    # `#` and `?` in the path are URI syntax unless percent-encoded.
+    from urllib.parse import quote
+    return sqlite3.connect("file:" + quote(db, safe="/") + "?mode=ro", uri=True, timeout=2.0)
 
 
 def _query(transcript_path, sql, args=()):
