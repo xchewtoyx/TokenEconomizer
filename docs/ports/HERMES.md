@@ -76,9 +76,14 @@ Notes:
 - **`transform_tool_result` instead of `post_tool_call`.** It receives the same payload, and it
   is the only hook that can add a redirect to what the model reads next without blocking the
   call. One hook does both jobs.
-- **Payloads carry no `cwd`.** Every payload the shim builds sets `cwd = ctx.session_cwd()`
-  [SRC `plugins.py:597`]. If that returns `None`, the shim sends nothing; the session is not
-  pinned to a repository.
+- **Payloads carry no `cwd`.** The section's session info may carry one
+  (`resolve_context_cwd()`, often empty on the CLI). Hook kwargs do not. v0.21.5's
+  `PluginContext` (tag `v2026.9.24`, `f97608f`) has no `session_cwd`; that method is
+  later (`plugins.py` on main). The shim uses `session_cwd()` when the method exists,
+  otherwise the directory v0.21.5 pins on `agent.runtime_cwd` (cron and the gateway set
+  it and do not chdir), otherwise `sessions.cwd` in `state.db`, otherwise the process
+  cwd (`resolve_agent_cwd`: `TERMINAL_CWD`, then `os.getcwd()`). An empty result sends
+  nothing.
 - **Subagents.** The shim sets `agent_id` when the session has a `parent_session_id` or is
   running under `delegate_task` [?], so `Host.is_subagent` skips its calls.
   Implemented differently: `parent_session_id` is **not** a subagent marker, because a
@@ -231,7 +236,7 @@ ctx.register_command("te", handler, description="TokenEconomizer status and sett
 The handler:
 
 1. takes the `session_id` keyword argument;
-2. spawns `scripts/te --host hermes --cwd <ctx.session_cwd()> <args>` with
+2. spawns `scripts/te --host hermes --cwd <the directory resolved above> <args>` with
    `TE_SESSION_ID=<session_id>`;
 3. returns its stdout as text, because Hermes drops anything printed from a handler.
 

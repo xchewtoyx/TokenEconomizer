@@ -124,6 +124,101 @@ def _hermes_home():
     return os.environ.get("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
 
 
+# Hermes treats these as "no directory" (agent/relay_cwd.py).
+_CWD_SKIP = {"", ".", "./", "auto", "cwd"}
+
+
+def _usable_cwd(value):
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    return "" if value.lower() in _CWD_SKIP else value
+
+
+def _context_cwd(ctx):
+    """PluginContext.session_cwd() when this Hermes has it.
+
+    v0.21.5 (f97608f, the v2026.9.24 image) has no such method. A method that
+    exists and raises still propagates: the callback guard logs it."""
+    fn = getattr(ctx, "session_cwd", None)
+    if not callable(fn):
+        return ""
+    got = fn()
+    return _usable_cwd(got)
+
+
+def _hermes_call(module, name):
+    """Call `name` in a Hermes module, or None when this process is not Hermes.
+
+    Loaded by name so the shim stays importable without Hermes installed."""
+    try:
+        import importlib
+        fn = getattr(importlib.import_module(module), name)
+        return fn() if callable(fn) else None
+    except Exception:
+        return None
+
+
+def _runtime_session_cwd():
+    """The directory Hermes v0.21.5 pinned for this task, or "".
+
+    Cron and the gateway set `agent.runtime_cwd`'s session contextvar
+    (`gateway.session_context.set_session_vars(cwd=...)`) and do not chdir."""
+    return _usable_cwd(_hermes_call("agent.runtime_cwd", "scoped_session_cwd"))
+
+
+def _recorded_cwd(sid):
+    """`sessions.cwd` for this session in the profile's state.db, or ""."""
+    if not sid:
+        return ""
+    db = os.path.join(_hermes_home(), "state.db")
+    if not os.path.isfile(db):
+        return ""
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
+        try:
+            row = con.execute("SELECT cwd FROM sessions WHERE id = ?", (sid,)).fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return ""
+    return _usable_cwd(row[0] if row else "")
+
+
+def _process_cwd():
+    """TERMINAL_CWD, else the process cwd: what `resolve_agent_cwd` returns when no
+    session directory is pinned. The process cwd alone, outside a Hermes process."""
+    got = _hermes_call("agent.runtime_cwd", "resolve_agent_cwd")
+    if got:
+        return _usable_cwd(str(got))
+    try:
+        return os.getcwd()
+    except OSError:
+        return ""
+
+
+def _working_dir(ctx, sid, explicit=None):
+    """Where this session's repository is.
+
+    A directory the event already carried wins. Otherwise a later Hermes'
+    `session_cwd()`, then the directory v0.21.5 actually pins, then the session
+    row, then the process cwd. Each step runs only when the earlier ones are empty."""
+    got = _usable_cwd(explicit)
+    if got:
+        return got
+    got = _context_cwd(ctx)
+    if got:
+        return got
+    got = _runtime_session_cwd()
+    if got:
+        return got
+    got = _recorded_cwd(sid)
+    if got:
+        return got
+    return _process_cwd()
+
+
 def register(ctx):
     subagents = set()           # session ids of `delegate_task` children
     platforms = {}              # session id -> platform, from on_session_start
@@ -146,7 +241,7 @@ def register(ctx):
         pin it to."""
         if not sid or sid in subagents:
             return None
-        cwd = cwd or ctx.session_cwd()
+        cwd = _working_dir(ctx, sid, cwd)
         if not cwd:
             return None
         return {"session_id": sid, "cwd": cwd,
@@ -260,7 +355,7 @@ def register(ctx):
     @_guarded(default="te: the command failed; see ~/.tokeneconomizer/errors.log")
     def te(raw_args="", session_id=None, **_):
         argv = (raw_args or "status").split()
-        cwd = ctx.session_cwd() or os.getcwd()
+        cwd = _working_dir(ctx, str(session_id or ""))
         out = _run("te", ["--host", "hermes", "--cwd", cwd] + argv, "", SLOW_S,
                    {"TE_SESSION_ID": str(session_id or "")})
         return out.strip() or "te: no output (is Python 3.10+ on PATH?)"
