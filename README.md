@@ -64,9 +64,9 @@ mechanisms:
   itself.
 
 TokenEconomizer is a plugin for **Claude Code**, **Codex**, the **GitHub Copilot CLI** and **Pi**;
-support for **OpenClaw** is new and not yet run with a model, and a port to **Hermes Agent** is in
-progress and not yet checked on a running Hermes
-([plugin/README.md](plugin/README.md#hermes-agent-unverified)).
+support for **Hermes Agent** and **OpenClaw** is new: each has passed one live test with a model
+so far ([plugin/README.md](plugin/README.md#hermes-agent)). Container setups for both are described
+in [Running in Docker](plugin/README.md#running-in-docker) but have not been run yet.
 Each italic letter above is a setting, shown with its default ([Settings](#settings)), and each
 mechanism can be turned on or off. The plugin announces each action in one line, and if any part
 of it fails, your session carries on as if it were not installed. Its model calls (the fact
@@ -191,7 +191,8 @@ uninstalling, using Copilot with your own model key, and troubleshooting.
 | Codex | 0.153.1 to 0.164.0 | not supported |
 | Copilot CLI | 1.0.83 to 1.0.102 | not supported |
 | Pi | 1.2.0 to 1.3.0 | 0.99.x: load the extension by path (below) |
-| OpenClaw | 2026.10.8 (loaded, not yet run with a model) | not supported |
+| Hermes Agent | v0.22.5 (one live test) | not supported |
+| OpenClaw | 2026.10.8 (one live test) | not supported |
 
 The commands above were tested on the oldest and newest version in each range; newer versions
 have not been tested yet.
