@@ -399,7 +399,7 @@ mounted plugins folder, then enable it once:
 ```bash
 python scripts/build_plugin.py --out /tmp/te-build
 cp -r /tmp/te-build/hermes/tokeneconomizer ~/.hermes/plugins/      # ~/.hermes is /opt/data
-docker exec hermes hermes plugins enable tokeneconomizer
+docker compose exec hermes hermes plugins enable tokeneconomizer
 ```
 
 ```yaml
@@ -419,7 +419,10 @@ services:
 
 **OpenClaw** (`ghcr.io/openclaw/openclaw`). `~/.openclaw` (the state mount) persists, including
 `plugins.load.paths`; the entrypoint only runs `openclaw doctor --fix` before the gateway. Mount
-a read-only checkout and link it once:
+a read-only checkout and link it once. The snippet below is a `docker-compose.override.yml` beside
+OpenClaw's own `docker-compose.yml`, which already mounts the state directory
+(`OPENCLAW_CONFIG_DIR` → `/home/node/.openclaw`) in both `openclaw-gateway` and `openclaw-cli`;
+Compose merges the volume lists, so the CLI's install lands in the state the gateway reads:
 
 ```bash
 git clone https://github.com/microsoft/TokenEconomizer /opt/tokeneconomizer
@@ -427,6 +430,7 @@ sudo chown -R root:root /opt/tokeneconomizer && sudo chmod -R go-w /opt/tokeneco
 ```
 
 ```yaml
+# docker-compose.override.yml (adds to OpenClaw's docker-compose.yml)
 services:
   openclaw-gateway:
     volumes: ["/opt/tokeneconomizer:/opt/tokeneconomizer:ro"]
