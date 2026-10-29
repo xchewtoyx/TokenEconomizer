@@ -559,8 +559,8 @@ authored again under a new id; the experiments' prompt names the ids alone, as t
 **Hermes Agent v0.22.5 — read from source, and run with a model in the live test** (live run
 40789990787, 2026-10-28, `z-ai/glm-5.3-flash` through OpenRouter, Hermes installed by its own
 `scripts/install.sh` at `bf0203a7`: five trap sessions, each recorded with a priced ledger row,
-the fact injected at a later start, `errors.log` empty). Read from the source at `main` `6696c7b0`
-(2026-10-28, release date 2026.9.24); the spec and its citations are
+the fact injected at a later start, `errors.log` empty). The port itself was written from the source
+at `main` `6696c7b0` (2026-10-28), a few days after the v0.22.5 release the live test ran; the spec and its citations are
 [`docs/ports/HERMES.md`](ports/HERMES.md). Before the live test, offline, the plugin's tests drive the shim (`plugin/hermes/`) against the real
 launcher and fold synthetic `state.db` files. One smoke test used Hermes' own plugin manager,
 from that source (on Python 3.13; Hermes asks for 3.14), with the plugin linked into
