@@ -7,8 +7,8 @@ behaviour of each agent are in [`docs/PLUGIN.md`](../docs/PLUGIN.md).
 
 - [Before you start](#before-you-start)
 - Install and use it on [Claude Code](#claude-code) · [Codex](#codex) ·
-  [Copilot CLI](#copilot-cli) · [Pi](#pi) · [Hermes Agent](#hermes-agent-unverified) ·
-  [OpenClaw](#openclaw)
+  [Copilot CLI](#copilot-cli) · [Pi](#pi) · [Hermes Agent](#hermes-agent) ·
+  [OpenClaw](#openclaw) · [Running in Docker](#running-in-docker)
 - [What to expect](#what-to-expect) · [Commands](#commands) · [Settings](#settings)
 - [Repository map](#repository-map) · [Using with rtk](#using-with-rtk) ·
   [Model calls and API keys](#model-calls-and-api-keys) · [Troubleshooting](#troubleshooting)
@@ -286,11 +286,10 @@ after the loop guard's redirect gets a notice: press **Esc** to abort it, or Ctr
 **Uninstall.** `pi remove git:github.com/microsoft/TokenEconomizer` (the source you installed
 from); `pi config` turns it off without removing it. Optional: `rm -rf ~/.tokeneconomizer`.
 
-## Hermes Agent (unverified)
+## Hermes Agent
 
-This port was written from Hermes' source (`docs/ports/HERMES.md`) and has not yet been run on a
-real Hermes. Expect rough edges; [`docs/PLUGIN.md`](../docs/PLUGIN.md) §3 lists what is still
-to be checked. Tool pruning does not apply yet.
+New: it has passed one live test on Hermes v0.22.5 with a model; [`docs/PLUGIN.md`](../docs/PLUGIN.md)
+§3 says what that covered and what is still to be checked. Tool pruning does not apply yet.
 
 **1. Install.** Hermes loads a plugin directory from `$HERMES_HOME/plugins/` (`~/.hermes`, or
 `~/.hermes/profiles/<name>` for a named profile; each profile installs and enables plugins on its
@@ -333,8 +332,8 @@ terminal end up in two places. The plugin runs the `python3` on `PATH`.
 
 ## OpenClaw
 
-Not yet verified against a running gateway with a model: see the OpenClaw block in
-[`docs/PLUGIN.md`](../docs/PLUGIN.md) §3 for what has been checked. Needs OpenClaw 2026.10.8 or
+New: it has passed one live test with a model, through `openclaw agent exec`; the OpenClaw block
+in [`docs/PLUGIN.md`](../docs/PLUGIN.md) §3 says what has been checked. Needs OpenClaw 2026.10.8 or
 later and `python3` (3.10+) on the gateway host; the official images have it.
 
 **1. Install.** Clone the repository and link its `plugin/openclaw` directory, which keeps it in
@@ -385,6 +384,69 @@ and whether `allowConversationAccess` is on. In a session, `/te status`, `/te mi
 
 **Uninstall.** `openclaw plugins uninstall tokeneconomizer`. Optional:
 `rm -rf ~/.tokeneconomizer`.
+
+## Running in Docker
+
+Read from each image's source and docs; neither image has been run with the plugin yet. Both
+stock images ship `python3`, so neither needs a derived image. In both, set
+`TOKENECONOMIZER_HOME` inside the volume that persists, so what the plugin learns survives a
+container rebuild and an image upgrade, and mount the repositories the agent works in.
+
+**Hermes** (`nousresearch/hermes-agent`). Only `/opt/data` (`HERMES_HOME`) persists, plugins
+included; the rest of the image is replaced on upgrade. Install the self-contained build into the
+mounted plugins folder, then enable it once:
+
+```bash
+python scripts/build_plugin.py --out /tmp/te-build
+cp -r /tmp/te-build/hermes/tokeneconomizer ~/.hermes/plugins/      # ~/.hermes is /opt/data
+docker exec hermes hermes plugins enable tokeneconomizer
+```
+
+```yaml
+services:
+  hermes:
+    image: nousresearch/hermes-agent:v0.22.5
+    volumes: ["~/.hermes:/opt/data", "~/src:/workspace"]
+    environment: ["TOKENECONOMIZER_HOME=/opt/data/tokeneconomizer"]
+    working_dir: /workspace
+    command: ["gateway", "run"]
+```
+
+- The gateway runs with `HOME=/opt/data` and the terminal tool with `HOME=/opt/data/home`, which
+  is why `TOKENECONOMIZER_HOME` must be set: without it the two keep separate state.
+- Each named profile (`/opt/data/profiles/<name>`) installs and enables the plugin on its own.
+- With `terminal.backend: docker`, mount the repositories at the same path in the sandbox.
+
+**OpenClaw** (`ghcr.io/openclaw/openclaw`). `~/.openclaw` (the state mount) persists, including
+`plugins.load.paths`; the entrypoint only runs `openclaw doctor --fix` before the gateway. Mount
+a read-only checkout and link it once:
+
+```bash
+git clone https://github.com/microsoft/TokenEconomizer /opt/tokeneconomizer
+sudo chown -R root:root /opt/tokeneconomizer && sudo chmod -R go-w /opt/tokeneconomizer
+```
+
+```yaml
+services:
+  openclaw-gateway:
+    volumes: ["/opt/tokeneconomizer:/opt/tokeneconomizer:ro"]
+    environment: { TOKENECONOMIZER_HOME: /home/node/.openclaw/tokeneconomizer }
+  openclaw-cli:
+    volumes: ["/opt/tokeneconomizer:/opt/tokeneconomizer:ro"]
+    environment: { TOKENECONOMIZER_HOME: /home/node/.openclaw/tokeneconomizer }
+```
+
+```bash
+docker compose run --rm openclaw-cli plugins install -l /opt/tokeneconomizer/plugin/openclaw --accept-capabilities --force
+docker compose run --rm openclaw-cli config set plugins.entries.tokeneconomizer.hooks.allowConversationAccess true
+```
+
+- The checkout must be owned by root or the gateway's user (uid 1000) and not world-writable, or
+  OpenClaw skips the plugin ("suspicious ownership").
+- To update: `git pull` in the checkout, then `openclaw plugins reload tokeneconomizer`.
+- Without `TOKENECONOMIZER_HOME` the state lands in the container's writable layer and is lost
+  when the container is recreated.
+- Do not reinstall from an entrypoint override: it can skip or race the image's `doctor` step.
 
 ## What to expect
 

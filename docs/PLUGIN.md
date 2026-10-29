@@ -556,10 +556,12 @@ the judge's gate opens in 18.1%, 15.8% and 5.8% of them.
 The plugin's proposer prompt lists each fact it holds with its claim, so a fact it has is not
 authored again under a new id; the experiments' prompt names the ids alone, as the paper ran it.
 
-**Hermes Agent — NOT verified on a running Hermes.** Read from the source at `main` `6696c7b0`
+**Hermes Agent v0.22.5 — read from source, and run with a model in the live test** (live run
+40789990787, 2026-10-28, `z-ai/glm-5.3-flash` through OpenRouter, Hermes installed by its own
+`scripts/install.sh` at `bf0203a7`: five trap sessions, each recorded with a priced ledger row,
+the fact injected at a later start, `errors.log` empty). Read from the source at `main` `6696c7b0`
 (2026-10-28, release date 2026.9.24); the spec and its citations are
-[`docs/ports/HERMES.md`](ports/HERMES.md). No agent turn has been run: no model key was
-available. Offline, the plugin's tests drive the shim (`plugin/hermes/`) against the real
+[`docs/ports/HERMES.md`](ports/HERMES.md). Before the live test, offline, the plugin's tests drive the shim (`plugin/hermes/`) against the real
 launcher and fold synthetic `state.db` files. One smoke test used Hermes' own plugin manager,
 from that source (on Python 3.13; Hermes asks for 3.14), with the plugin linked into
 `$HERMES_HOME/plugins/` and enabled in `config.yaml`: it was discovered and loaded, registered
